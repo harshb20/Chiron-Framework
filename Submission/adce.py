@@ -195,7 +195,7 @@ def run_adce(cfg, ssa_info, executable_blocks):
 
         # Also trace phi operands if this block has phis that are live
         for var in ssa_info.phi_nodes.get(block, {}):
-            phi_ver = ssa_info.var_version_def.get((var, block))
+            phi_ver = ssa_info.get_phi_def_version(block, var)
             if phi_ver is not None:
                 for pred_block, pred_ver in ssa_info.phi_nodes[block][var].items():
                     if pred_ver >= 0:

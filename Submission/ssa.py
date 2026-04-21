@@ -64,7 +64,8 @@ class SSAInfo:
 
         self.phi_nodes = {}
 
-        self.var_version_def = {}
+        self.phi_version_def = {}
+        self.instr_version_def = {}
         self.var_version_use = {}
         self.def_site = {}
         self.uses = {}
@@ -75,6 +76,15 @@ class SSAInfo:
         self.rpo = []
         self._start = None
         self._end = None
+
+    def get_phi_def_version(self, block, var):
+        return self.phi_version_def.get((var, block))
+
+    def get_instr_def_version(self, block, var):
+        return self.instr_version_def.get((var, block))
+
+    def block_has_phi_def(self, block, var):
+        return (var, block) in self.phi_version_def
 
     def build(self):
         self._find_special_blocks()
@@ -209,16 +219,20 @@ class SSAInfo:
         version_counter = {var: 0 for var in self.all_vars}
         version_stack = {var: [] for var in self.all_vars}
 
-        self.var_version_def = {}
+        self.phi_version_def = {}
+        self.instr_version_def = {}
         self.var_version_use = {}
         self.def_site = {}
         self.uses = {}
 
-        def new_version(var, block):
+        def new_version(var, block, is_phi=False):
             ver = version_counter[var]
             version_counter[var] += 1
             version_stack[var].append(ver)
-            self.var_version_def[(var, block)] = ver
+            if is_phi:
+                self.phi_version_def[(var, block)] = ver
+            else:
+                self.instr_version_def[(var, block)] = ver
             self.def_site[(var, ver)] = block
             return ver
 
@@ -231,7 +245,7 @@ class SSAInfo:
             pushed = {var: 0 for var in self.all_vars}
 
             for var in self.phi_nodes.get(block, {}):
-                new_version(var, block)
+                new_version(var, block, is_phi=True)
                 pushed[var] += 1
 
             instr = get_block_instr(block)
@@ -246,7 +260,7 @@ class SSAInfo:
 
                 d = var_defined_by(instr)
                 if d is not None:
-                    new_version(d, block)
+                    new_version(d, block, is_phi=False)
                     pushed[d] += 1
 
             for succ in self.cfg.successors(block):
@@ -280,17 +294,19 @@ class SSAInfo:
                     pred_str = ", ".join(
                         f"{p.name}:v{v}" for p, v in preds.items()
                     )
-                    ver = self.var_version_def.get((var, block), "?")
+                    ver = self.phi_version_def.get((var, block), "?")
                     print(f"  [{block.name}] {var}_v{ver} = phi({pred_str})")
 
         print("\nDefinitions:")
         for (var, block), ver in sorted(
-            self.var_version_def.items(), key=lambda x: (x[0][0], x[1])
+            self.phi_version_def.items(), key=lambda x: (x[0][0], x[1])
+        ):
+            print(f"  {var}_v{ver} defined at [{block.name}] (phi)")
+        for (var, block), ver in sorted(
+            self.instr_version_def.items(), key=lambda x: (x[0][0], x[1])
         ):
             instr = get_block_instr(block)
-            is_phi = var in self.phi_nodes.get(block, {})
-            src = "phi" if is_phi else str(instr)
-            print(f"  {var}_v{ver} defined at [{block.name}] ({src})")
+            print(f"  {var}_v{ver} defined at [{block.name}] ({str(instr)})")
 
         print("\nUses:")
         for (var, block), ver in sorted(
