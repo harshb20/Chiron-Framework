@@ -155,6 +155,11 @@ if __name__ == "__main__":
         help="Run dead code elimination optimization.",
     )
     cmdparser.add_argument(
+        "--opt-licm",
+        action="store_true",
+        help="Run loop invariant code motion optimization.",
+    )
+    cmdparser.add_argument(
         "--opt-all",
         action="store_true",
         help="Run all optimizations.",
@@ -261,7 +266,7 @@ if __name__ == "__main__":
         AISub.analyzeUsingAI(irHandler)
         print("== Abstract Interpretation ==")
 
-    if args.dataFlowAnalysis or args.opt_constfold or args.opt_algsimp or args.opt_constprop or args.opt_dce or args.opt_all:
+    if args.dataFlowAnalysis or args.opt_constfold or args.opt_algsimp or args.opt_constprop or args.opt_dce or args.opt_licm or args.opt_all:
         irOpt = DFASub.optimize(irHandler, args)
         irHandler.setIR(irOpt)
         print("== Optimized IR ==")

@@ -14,6 +14,7 @@ import dataFlowAnalysis as DFA
 from ssa import SSAInfo, vars_in_expr, vars_used_in, get_block_instr, get_block_ir_idx
 from sccp import SCCP, ConstVal, OVERDEF, UNDEF
 from adce import run_adce, dump_adce
+from licm import run_licm
 
 
 '''
@@ -359,52 +360,54 @@ def run_m1_passes(ir, do_fold, do_simp):
     return ir
 
 
+def rebuild_cfg_and_ssa(ir, name="opt_cfg"):
+    cfg = cfgB.buildCFG(ir, name, isSingle=True)
+    ssa_info = SSAInfo(cfg)
+    ssa_info.build()
+    return cfg, ssa_info
+
+
 def optimize(irHandler, args):
     ir = copy.deepcopy(irHandler.ir)
 
     do_fold = args.opt_constfold or args.opt_all
     do_simp = args.opt_algsimp or args.opt_all
     do_sccp = args.opt_constprop or args.opt_all
+    do_licm = getattr(args, "opt_licm", False) or args.opt_all
     do_adce = args.opt_dce or args.opt_all
 
-    if not (do_fold or do_simp or do_sccp or do_adce):
+    if not (do_fold or do_simp or do_sccp or do_licm or do_adce):
         return irHandler.ir
 
     if do_fold or do_simp:
         ir = run_m1_passes(ir, do_fold, do_simp)
 
-    if do_sccp or do_adce:
-        cfg = cfgB.buildCFG(ir, "opt_cfg", isSingle=True)
+    if do_sccp:
+        cfg, ssa_info = rebuild_cfg_and_ssa(ir, "opt_cfg_sccp")
+        sccp_result = SCCP(cfg, ssa_info)
+        sccp_result.run()
 
-        ssa_info = SSAInfo(cfg)
-        ssa_info.build()
+        ir = apply_sccp(ir, cfg, ssa_info, sccp_result)
+
+        if do_fold or do_simp:
+            ir = run_m1_passes(ir, True, True)
+
+    if do_licm:
+        cfg, ssa_info = rebuild_cfg_and_ssa(ir, "opt_cfg_licm")
+        ir = run_licm(ir, cfg, ssa_info)
+
+    if do_adce:
+        cfg, ssa_info = rebuild_cfg_and_ssa(ir, "opt_cfg_adce")
 
         if do_sccp:
-            sccp_result = SCCP(cfg, ssa_info)
-            sccp_result.run()
+            sccp_post = SCCP(cfg, ssa_info)
+            sccp_post.run()
+            executable_blocks = sccp_post.executable_blocks
+        else:
+            executable_blocks = set(cfg.nodes())
 
-            ir = apply_sccp(ir, cfg, ssa_info, sccp_result)
+        live_blocks = run_adce(cfg, ssa_info, executable_blocks)
 
-            if do_fold or do_simp:
-                ir = run_m1_passes(ir, True, True)
-
-        if do_adce:
-            if do_sccp:
-                cfg = cfgB.buildCFG(ir, "opt_cfg_post_sccp", isSingle=True)
-                ssa_info = SSAInfo(cfg)
-                ssa_info.build()
-
-                sccp_post = SCCP(cfg, ssa_info)
-                sccp_post.run()
-                executable_blocks = sccp_post.executable_blocks
-            else:
-                cfg = cfgB.buildCFG(ir, "opt_cfg", isSingle=True)
-                ssa_info = SSAInfo(cfg)
-                ssa_info.build()
-                executable_blocks = set(cfg.nodes())
-
-            live_blocks = run_adce(cfg, ssa_info, executable_blocks)
-
-            ir = apply_adce(ir, cfg, ssa_info, live_blocks, executable_blocks)
+        ir = apply_adce(ir, cfg, ssa_info, live_blocks, executable_blocks)
 
     return ir
