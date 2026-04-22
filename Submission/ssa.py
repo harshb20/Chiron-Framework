@@ -186,7 +186,7 @@ class SSAInfo:
         self.dom_frontier = {b: set() for b in self.rpo}
 
         for b in self.rpo:
-            preds = list(self.cfg.predecessors(b))
+            preds = [p for p in self.cfg.predecessors(b) if p in self.dom_frontier]
             if len(preds) < 2:
                 continue
             for p in preds:

@@ -382,7 +382,13 @@ def optimize(irHandler, args):
 
         if do_adce:
             if do_sccp:
-                executable_blocks = sccp_result.executable_blocks
+                cfg = cfgB.buildCFG(ir, "opt_cfg_post_sccp", isSingle=True)
+                ssa_info = SSAInfo(cfg)
+                ssa_info.build()
+
+                sccp_post = SCCP(cfg, ssa_info)
+                sccp_post.run()
+                executable_blocks = sccp_post.executable_blocks
             else:
                 cfg = cfgB.buildCFG(ir, "opt_cfg", isSingle=True)
                 ssa_info = SSAInfo(cfg)
