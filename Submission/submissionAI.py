@@ -11,80 +11,244 @@ from lattice import  *
 import ChironAST.ChironAST as ChironAST
 import abstractInterpretation as AI
 
-'''
-    Class for interval domain
-'''
+
+INF = math.inf
+MAX_MAG = 10**6
+
+
 class IntervalDomain(Lattice):
+    """Integer interval [low, high] with ±∞ bounds and widening."""
 
-    '''Initialize abstract value'''
-    def __init__(self, data):
-        pass
+    def __init__(self, data=None):
+        if data is None:
+            self.low, self.high = -INF, INF
+        elif isinstance(data, IntervalDomain):
+            self.low, self.high = data.low, data.high
+        elif isinstance(data, tuple):
+            self.low, self.high = data
+        elif isinstance(data, int):
+            self.low = self.high = data
+        else:
+            self.low, self.high = -INF, INF
 
-    '''To display abstract values'''
     def __str__(self):
-        pass
+        if self.isBot():
+            return "_|_"
+        lo = "-inf" if self.low == -INF else str(self.low)
+        hi = "+inf" if self.high == INF else str(self.high)
+        return f"[{lo}, {hi}]"
 
-    '''To check whether abstract value is bot or not'''
+    def __repr__(self):
+        return self.__str__()
+
     def isBot(self):
-        pass
+        return self.low > self.high
 
-    '''To check whether abstract value is Top or not'''
     def isTop(self):
-        pass
+        return self.low == -INF and self.high == INF
 
-    '''Implement the meet operator'''
     def meet(self, other):
-        pass
+        if self.isBot() or other.isBot():
+            return IntervalDomain((1, 0))
+        return IntervalDomain((max(self.low, other.low), min(self.high, other.high)))
 
-    '''Implement the join operator'''
     def join(self, other):
-        pass
+        if self.isBot():
+            return IntervalDomain(other)
+        if other.isBot():
+            return IntervalDomain(self)
+        lo = min(self.low, other.low)
+        hi = max(self.high, other.high)
+        if lo != -INF and lo < -MAX_MAG:
+            lo = -INF
+        if hi != INF and hi > MAX_MAG:
+            hi = INF
+        return IntervalDomain((lo, hi))
 
-    '''partial order with the other abstract value'''
     def __le__(self, other):
-        pass
+        if self.isBot():
+            return True
+        if other.isBot():
+            return False
+        return other.low <= self.low and self.high <= other.high
 
-    '''equality check with other abstract value'''
     def __eq__(self, other):
-        pass
+        if not isinstance(other, IntervalDomain):
+            return False
+        return self.low == other.low and self.high == other.high
 
-    '''
-        Add here required abstract transformers
-    '''
-    pass
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return hash((self.low, self.high))
+
+    # Abstract arithmetic transformers
+    def __add__(self, other):
+        if self.isBot() or other.isBot():
+            return IntervalDomain((1, 0))
+        return IntervalDomain((self.low + other.low, self.high + other.high))
+
+    def __sub__(self, other):
+        if self.isBot() or other.isBot():
+            return IntervalDomain((1, 0))
+        return IntervalDomain((self.low - other.high, self.high - other.low))
+
+    def __mul__(self, other):
+        if self.isBot() or other.isBot():
+            return IntervalDomain((1, 0))
+        prods = []
+        for a in (self.low, self.high):
+            for b in (other.low, other.high):
+                try:
+                    prods.append(a * b)
+                except Exception:
+                    prods.append(INF)
+        prods = [p for p in prods if not (isinstance(p, float) and math.isnan(p))]
+        if not prods:
+            return IntervalDomain((-INF, INF))
+        return IntervalDomain((min(prods), max(prods)))
+
+    def __truediv__(self, other):
+        if self.isBot() or other.isBot():
+            return IntervalDomain((1, 0))
+        if other.low <= 0 <= other.high:
+            return IntervalDomain((-INF, INF))
+        quots = []
+        for a in (self.low, self.high):
+            for b in (other.low, other.high):
+                try:
+                    if abs(b) == INF:
+                        quots.append(0)
+                    else:
+                        quots.append(int(a // b) if a not in (INF, -INF) else (INF if (a > 0) == (b > 0) else -INF))
+                except Exception:
+                    quots.append(INF)
+        return IntervalDomain((min(quots), max(quots)))
+
+    def __neg__(self):
+        if self.isBot():
+            return IntervalDomain((1, 0))
+        return IntervalDomain((-self.high, -self.low))
+
+
+TOP = IntervalDomain((-INF, INF))
+BOT = IntervalDomain((1, 0))
+
 
 class IntervalTransferFunction(TransferFunction):
     def __init__(self):
         pass
 
     def transferFunction(self, currBBIN, currBB):
-        '''
-            Transfer function for basic block 'currBB'
-            args: In val for currBB, currBB
-            Returns newly calculated values in a form of list
+        """Apply the instruction in currBB to its IN state, return OUT list.
+        Returns [out] for non-branch, [trueOut, falseOut] for ConditionCommand.
+        """
+        state = copy.deepcopy(currBBIN) if currBBIN else {}
 
-            This is the transfer function you write for Abstract Interpretation.
-        '''
-        #implement your transfer function here
-        outVal = []
-        return outVal
+        if not currBB.instrlist:
+            return [state]
+
+        instr = currBB.instrlist[0][0]
+
+        if isinstance(instr, ChironAST.AssignmentCommand):
+            val = self._eval(instr.rexpr, state)
+            state[instr.lvar.varname] = val
+            return [state]
+
+        if isinstance(instr, ChironAST.ConditionCommand):
+            trueState = copy.deepcopy(state)
+            falseState = copy.deepcopy(state)
+            self._narrow(instr.cond, trueState, falseState)
+            return [trueState, falseState]
+
+        # MoveCommand, PenCommand, GotoCommand, NoOp, Pause — no state change
+        return [state]
+
+    def _eval(self, expr, state):
+        if isinstance(expr, ChironAST.Num):
+            return IntervalDomain((expr.val, expr.val))
+        if isinstance(expr, ChironAST.Var):
+            return state.get(expr.varname, IntervalDomain((-INF, INF)))
+        if isinstance(expr, ChironAST.Sum):
+            return self._eval(expr.lexpr, state) + self._eval(expr.rexpr, state)
+        if isinstance(expr, ChironAST.Diff):
+            return self._eval(expr.lexpr, state) - self._eval(expr.rexpr, state)
+        if isinstance(expr, ChironAST.Mult):
+            return self._eval(expr.lexpr, state) * self._eval(expr.rexpr, state)
+        if isinstance(expr, ChironAST.Div):
+            return self._eval(expr.lexpr, state) / self._eval(expr.rexpr, state)
+        if isinstance(expr, ChironAST.UMinus):
+            return -self._eval(expr.expr, state)
+        return IntervalDomain((-INF, INF))
+
+    def _narrow(self, cond, trueState, falseState):
+        """Conservative narrowing: handle Var OP Var/Num for the 6 comparison ops.
+        Anything more complex leaves states unchanged.
+        """
+        if not isinstance(cond, (ChironAST.LT, ChironAST.GT, ChironAST.LTE,
+                                 ChironAST.GTE, ChironAST.EQ, ChironAST.NEQ)):
+            return
+
+        L, R = cond.lexpr, cond.rexpr
+        lVal = self._eval(L, trueState)
+        rVal = self._eval(R, trueState)
+
+        def set_var(state, var, iv):
+            if isinstance(var, ChironAST.Var):
+                state[var.varname] = state.get(var.varname, IntervalDomain((-INF, INF))).meet(iv)
+
+        if isinstance(cond, ChironAST.LT):
+            # true:  L < R  => L.high <= R.high-1, R.low >= L.low+1
+            set_var(trueState, L, IntervalDomain((-INF, rVal.high - 1)))
+            set_var(trueState, R, IntervalDomain((lVal.low + 1, INF)))
+            # false: L >= R
+            set_var(falseState, L, IntervalDomain((rVal.low, INF)))
+            set_var(falseState, R, IntervalDomain((-INF, lVal.high)))
+
+        elif isinstance(cond, ChironAST.GT):
+            # true:  L > R
+            set_var(trueState, L, IntervalDomain((rVal.low + 1, INF)))
+            set_var(trueState, R, IntervalDomain((-INF, lVal.high - 1)))
+            # false: L <= R
+            set_var(falseState, L, IntervalDomain((-INF, rVal.high)))
+            set_var(falseState, R, IntervalDomain((lVal.low, INF)))
+
+        elif isinstance(cond, ChironAST.LTE):
+            set_var(trueState, L, IntervalDomain((-INF, rVal.high)))
+            set_var(trueState, R, IntervalDomain((lVal.low, INF)))
+            set_var(falseState, L, IntervalDomain((rVal.low + 1, INF)))
+            set_var(falseState, R, IntervalDomain((-INF, lVal.high - 1)))
+
+        elif isinstance(cond, ChironAST.GTE):
+            set_var(trueState, L, IntervalDomain((rVal.low, INF)))
+            set_var(trueState, R, IntervalDomain((-INF, lVal.high)))
+            set_var(falseState, L, IntervalDomain((-INF, rVal.high - 1)))
+            set_var(falseState, R, IntervalDomain((lVal.low + 1, INF)))
+
+        elif isinstance(cond, ChironAST.EQ):
+            # true: L == R  => both narrow to intersection
+            inter = lVal.meet(rVal)
+            set_var(trueState, L, inter)
+            set_var(trueState, R, inter)
+            # false: no narrowing (can't express "not equal" as a single interval)
+
+        elif isinstance(cond, ChironAST.NEQ):
+            # true: L != R, no narrowing
+            # false: L == R, both narrow to intersection
+            inter = lVal.meet(rVal)
+            set_var(falseState, L, inter)
+            set_var(falseState, R, inter)
+
 
 class ForwardAnalysis():
     def __init__(self):
         self.transferFunctionInstance = IntervalTransferFunction()
         self.type = "IntervalTF"
 
-    '''
-        This function is to initialize in of the basic block currBB
-        Returns a dictinary {varName -> abstractValues}
-        isStartNode is a flag for stating whether currBB is start basic block or not
-    '''
     def initialize(self, currBB, isStartNode):
-        val = {}
-        #Your additional initialisation code if any
-        return val
+        return {}
 
-    #just a dummy equallity check function for dictionary
     def isEqual(self, dA, dB):
         for i in dA.keys():
             if i not in dB.keys():
@@ -93,24 +257,151 @@ class ForwardAnalysis():
                 return False
         return True
 
-    '''
-        Define the meet operation
-        Returns a dictinary {varName -> abstractValues}
-    '''
     def meet(self, predList):
+        """Join predecessor states: union of intervals per variable."""
         assert isinstance(predList, list)
-        meetVal = {}
+        if not predList:
+            return {}
 
-        return meetVal
+        all_vars = set()
+        for pred in predList:
+            all_vars.update(pred.keys())
+
+        result = {}
+        for var in all_vars:
+            joined = None
+            for pred in predList:
+                val = pred.get(var, IntervalDomain((-INF, INF)))
+                joined = val if joined is None else joined.join(val)
+            result[var] = joined
+        return result
+
+
+def _run_worklist(cfg, analysis):
+    """Inline worklist loop — mirrors AI.AbstractInterpreter.worklistAlgorithm
+    but skips the Interpreter base class (which the framework's
+    AbstractInterpreter forgets to pass params to)."""
+    from queue import Queue
+
+    BBlist = list(cfg.nodes())
+    bbIn = {}
+    bbOut = {}
+    for b in BBlist:
+        bbIn[b.name] = analysis.initialize(b, b.name == "START")
+        bbOut[b.name] = []
+
+    wl = Queue()
+    for b in BBlist:
+        if b.name != "END":
+            wl.put(b)
+
+    def _different(dA, dB):
+        if set(dA.keys()) != set(dB.keys()):
+            return True
+        for k in dA:
+            if dA[k] != dB[k]:
+                return True
+        return False
+
+    def _changed(newOut, oldOut):
+        if len(newOut) != len(oldOut):
+            return True
+        return any(_different(newOut[i], oldOut[i]) for i in range(len(newOut)))
+
+    iter_cap = 5000
+    iters = 0
+    visit_count = {}
+    WIDEN_AFTER = 3
+
+    while not wl.empty() and iters < iter_cap:
+        iters += 1
+        currBB = wl.get()
+        oldOut = bbOut[currBB.name]
+        oldIn = bbIn[currBB.name]
+        visit_count[currBB.name] = visit_count.get(currBB.name, 0) + 1
+
+        preds = list(cfg.predecessors(currBB))
+        inlist = []
+        for pred in preds:
+            label = cfg.get_edge_label(pred, currBB)
+            if bbOut[pred.name]:
+                if label != "Cond_False":
+                    inlist.append(bbOut[pred.name][0])
+                else:
+                    if len(bbOut[pred.name]) > 1:
+                        inlist.append(bbOut[pred.name][1])
+                    else:
+                        inlist.append(bbOut[pred.name][0])
+
+        if inlist:
+            newIn = analysis.meet(inlist)
+            # Classical widening: once a block has been revisited enough times,
+            # any bound that moved outward compared to the previous IN gets
+            # pushed to ±∞ to force termination.
+            if visit_count[currBB.name] >= WIDEN_AFTER and oldIn:
+                for var, iv in list(newIn.items()):
+                    old_iv = oldIn.get(var)
+                    if old_iv is None:
+                        continue
+                    lo = iv.low if iv.low >= old_iv.low else -INF
+                    hi = iv.high if iv.high <= old_iv.high else INF
+                    if lo != iv.low or hi != iv.high:
+                        newIn[var] = IntervalDomain((lo, hi))
+            bbIn[currBB.name] = newIn
+
+        tf = analysis.transferFunctionInstance
+        newOut = tf.transferFunction(bbIn[currBB.name], currBB)
+        assert isinstance(newOut, list)
+        bbOut[currBB.name] = newOut
+
+        if _changed(newOut, oldOut):
+            for succ in cfg.successors(currBB):
+                wl.put(succ)
+
+    return bbIn, bbOut
+
 
 def analyzeUsingAI(irHandler):
-    '''
-        get the cfg outof IR
-        each basic block consists of single statement
-    '''
-    # call worklist and get the in/out values of each basic block
-    abstractInterpreter = AI.AbstractInterpreter(irHandler)
-    bbIn, bbOut = abstractInterpreter.worklistAlgorithm(irHandler.cfg)
+    """Run interval analysis on the IR's CFG and print results per block."""
+    cfg = irHandler.cfg
+    if cfg is None:
+        cfg = cfgB.buildCFG(irHandler.ir, "ai_cfg", isSingle=True)
+        irHandler.setCFG(cfg)
+    analysis = ForwardAnalysis()
+    bbIn, bbOut = _run_worklist(cfg, analysis)
 
-    #implement your analysis according to the questions on each basic blocks
-    pass
+    print("\n===== INTERVAL ANALYSIS =====")
+    cfg = irHandler.cfg
+
+    def fmt_state(state):
+        if not state:
+            return "{}"
+        items = sorted(state.items())
+        return "{" + ", ".join(f"{k}={v}" for k, v in items) + "}"
+
+    def block_sort_key(b):
+        if b.name == "START":
+            return -1
+        if b.name == "END":
+            return 10**9
+        if b.instrlist:
+            return b.instrlist[0][1]
+        return 0
+
+    blocks = sorted(cfg.nodes(), key=block_sort_key)
+
+    for b in blocks:
+        instr_str = ""
+        if b.instrlist:
+            instr_str = str(b.instrlist[0][0])
+        print(f"  [{b.name}] {instr_str}")
+        print(f"    IN : {fmt_state(bbIn.get(b.name, {}))}")
+        out = bbOut.get(b.name, [])
+        if len(out) == 2:
+            print(f"    OUT[true] : {fmt_state(out[0])}")
+            print(f"    OUT[false]: {fmt_state(out[1])}")
+        elif len(out) == 1:
+            print(f"    OUT: {fmt_state(out[0])}")
+        else:
+            print(f"    OUT: (none)")
+    print("=============================\n")
