@@ -1,17 +1,18 @@
 """
-Phase 1/2 induction-variable analysis.
+Phase 1/2 induction-variable analysis plus a conservative Phase 3 rewrite.
 
 This pass detects loop-updated variables and simple basic induction-variable
-updates, then records simple derived induction-variable candidates. It
-intentionally does not rewrite IR.
+updates, records simple derived induction-variable candidates, and performs a
+small strength-reduction rewrite when the loop shape is unambiguous.
 """
 
+import copy
 from collections import defaultdict
 from dataclasses import dataclass, field
 
 import ChironAST.ChironAST as ChironAST
 from licm import find_loops
-from ssa import get_block_instr, get_block_ir_idx, vars_in_expr
+from ssa import get_block_instr, get_block_ir_idx, vars_in_expr, vars_used_in
 
 
 @dataclass(frozen=True)
@@ -511,6 +512,318 @@ def dump_indvar_info(info):
     print("===========================\n")
 
 
+def _instr_contains_div(instr):
+    if isinstance(instr, ChironAST.AssignmentCommand):
+        return _contains_div(instr.rexpr)
+    if isinstance(instr, ChironAST.ConditionCommand):
+        return _contains_div(instr.cond)
+    if isinstance(instr, ChironAST.AssertCommand):
+        return _contains_div(instr.cond)
+    if isinstance(instr, ChironAST.MoveCommand):
+        return _contains_div(instr.expr)
+    if isinstance(instr, ChironAST.GotoCommand):
+        return _contains_div(instr.xcor) or _contains_div(instr.ycor)
+    return False
+
+
+def _condition_old_target(ir, old_idx):
+    stmt, tgt = ir[old_idx]
+    if isinstance(stmt, ChironAST.ConditionCommand):
+        return old_idx + tgt
+    return None
+
+
+def _preheader_insertion_index(ir, loop):
+    preheader = loop.dedicated_preheader
+    if preheader is None:
+        return None
+
+    preheader_idx = get_block_ir_idx(preheader)
+    header_idx = get_block_ir_idx(loop.header)
+    if preheader_idx is None or header_idx is None:
+        return None
+    if preheader_idx < 0 or preheader_idx >= len(ir):
+        return None
+    if preheader_idx + 1 != header_idx:
+        return None
+
+    preheader_instr, preheader_tgt = ir[preheader_idx]
+    if isinstance(preheader_instr, ChironAST.ConditionCommand):
+        return None
+    if preheader_tgt != 1:
+        return None
+
+    return header_idx
+
+
+def _match_positive_repeat_header(instr):
+    if not isinstance(instr, ChironAST.ConditionCommand):
+        return None
+
+    cond = instr.cond
+    if not isinstance(cond, ChironAST.GT):
+        return None
+    if not isinstance(cond.lexpr, ChironAST.Var):
+        return None
+    if _const_value(cond.rexpr) != 0:
+        return None
+
+    varname = cond.lexpr.varname
+    if not _is_internal_loop_var(varname):
+        return None
+    return varname
+
+
+def _has_positive_repeat_count(ir, loop, counter_varname):
+    preheader = loop.dedicated_preheader
+    if preheader is None:
+        return False
+
+    preheader_idx = get_block_ir_idx(preheader)
+    if preheader_idx is None or preheader_idx < 0 or preheader_idx >= len(ir):
+        return False
+
+    instr, _ = ir[preheader_idx]
+    if not isinstance(instr, ChironAST.AssignmentCommand):
+        return False
+    if instr.lvar.varname != counter_varname:
+        return False
+
+    repeat_count = _const_value(instr.rexpr)
+    return repeat_count is not None and repeat_count > 0
+
+
+def _is_standard_counter_decrement(update, counter_varname):
+    if update.varname != counter_varname:
+        return False
+    match = _match_basic_indvar_update(counter_varname, update.instr.rexpr)
+    return match == ("-", 1)
+
+
+def _simple_repeat_loop_shape(ir, loop_info, loop):
+    header_idx = get_block_ir_idx(loop.header)
+    tail_idx = get_block_ir_idx(loop.tail)
+    if header_idx is None or tail_idx is None:
+        return None
+    if not (0 <= header_idx < tail_idx < len(ir)):
+        return None
+
+    loop_indices = sorted(
+        get_block_ir_idx(block)
+        for block in loop.blocks
+        if get_block_ir_idx(block) is not None
+    )
+    if loop_indices != list(range(header_idx, tail_idx + 1)):
+        return None
+
+    header_instr, _ = ir[header_idx]
+    counter_varname = _match_positive_repeat_header(header_instr)
+    if counter_varname is None:
+        return None
+    if not _has_positive_repeat_count(ir, loop, counter_varname):
+        return None
+
+    tail_instr, _ = ir[tail_idx]
+    if not isinstance(tail_instr, ChironAST.ConditionCommand):
+        return None
+    if not isinstance(tail_instr.cond, ChironAST.BoolFalse):
+        return None
+    if _condition_old_target(ir, tail_idx) != header_idx:
+        return None
+
+    header_exit_idx = _condition_old_target(ir, header_idx)
+    if header_exit_idx != tail_idx + 1:
+        return None
+
+    if _preheader_insertion_index(ir, loop) != header_idx:
+        return None
+
+    internal_updates = [
+        update
+        for update in loop_info.skipped_internal_updates
+        if _is_internal_loop_var(update.varname)
+    ]
+    if len(internal_updates) != 1:
+        return None
+    if not _is_standard_counter_decrement(internal_updates[0], counter_varname):
+        return None
+
+    for block in loop.blocks:
+        idx = get_block_ir_idx(block)
+        instr = get_block_instr(block)
+        if idx is None or instr is None:
+            return None
+        if _instr_contains_div(instr):
+            return None
+        if isinstance(instr, ChironAST.ConditionCommand) and idx not in (
+            header_idx,
+            tail_idx,
+        ):
+            return None
+        for varname in vars_used_in(instr):
+            if _is_internal_loop_var(varname) and varname != counter_varname:
+                return None
+
+    return header_idx, tail_idx
+
+
+def _assignment_counts_by_var(loop):
+    counts = defaultdict(int)
+    for block in loop.blocks:
+        instr = get_block_instr(block)
+        if isinstance(instr, ChironAST.AssignmentCommand):
+            counts[instr.lvar.varname] += 1
+    return counts
+
+
+def _uses_var(instr, varname):
+    return varname in vars_used_in(instr)
+
+
+def _derived_uses_allow_post_basic_update(ir, loop, basic, derived):
+    tail_idx = get_block_ir_idx(loop.tail)
+    if tail_idx is None:
+        return False
+
+    for block in loop.blocks:
+        idx = get_block_ir_idx(block)
+        if idx is None or idx == derived.ir_index:
+            continue
+        instr = get_block_instr(block)
+        if instr is None or not _uses_var(instr, derived.varname):
+            continue
+        if not (derived.ir_index < idx < basic.ir_index):
+            return False
+
+    for idx in range(tail_idx + 1, len(ir)):
+        if _uses_var(ir[idx][0], derived.varname):
+            return False
+
+    return True
+
+
+def _make_increment_expr(varname, step):
+    if step >= 0:
+        return ChironAST.Sum(ChironAST.Var(varname), ChironAST.Num(step))
+    return ChironAST.Diff(ChironAST.Var(varname), ChironAST.Num(-step))
+
+
+def _phase3_rewrite_for_loop(ir, loop_info, loop):
+    if len(loop_info.basic_candidates) != 1:
+        return None
+    if len(loop_info.derived_candidates) != 1:
+        return None
+    if loop_info.skipped_ambiguous_updates or loop_info.skipped_ambiguous_derived:
+        return None
+
+    basic = loop_info.basic_candidates[0]
+    derived = loop_info.derived_candidates[0]
+
+    if _is_internal_loop_var(basic.varname) or _is_internal_loop_var(derived.varname):
+        return None
+    if derived.base_varname != basic.varname:
+        return None
+    if derived.op != "*":
+        return None
+
+    loop_bounds = _simple_repeat_loop_shape(ir, loop_info, loop)
+    if loop_bounds is None:
+        return None
+    header_idx, tail_idx = loop_bounds
+
+    if not (header_idx < derived.ir_index < basic.ir_index < tail_idx):
+        return None
+
+    assignment_counts = _assignment_counts_by_var(loop)
+    if assignment_counts[derived.varname] != 1:
+        return None
+    if assignment_counts[basic.varname] != 1:
+        return None
+
+    if not _derived_uses_allow_post_basic_update(ir, loop, basic, derived):
+        return None
+
+    basic_delta = basic.constant if basic.op == "+" else -basic.constant
+    derived_delta = basic_delta * derived.constant
+    if derived_delta == 0:
+        return None
+
+    init_instr = ChironAST.AssignmentCommand(
+        copy.deepcopy(derived.instr.lvar),
+        copy.deepcopy(derived.instr.rexpr),
+    )
+    update_instr = ChironAST.AssignmentCommand(
+        ChironAST.Var(derived.varname),
+        _make_increment_expr(derived.varname, derived_delta),
+    )
+
+    return {
+        "insert_before": {header_idx: [init_instr]},
+        "insert_after": {basic.ir_index: [update_instr]},
+        "replace_with_nop": {derived.ir_index},
+    }
+
+
+def _rebuild_ir_with_indvar_rewrites(
+    ir, insert_before, insert_after, replace_with_nop
+):
+    old_to_new = {}
+    rebuilt = []
+
+    for old_idx, (stmt, tgt) in enumerate(ir):
+        for inserted in insert_before.get(old_idx, []):
+            rebuilt.append((inserted, None))
+
+        old_to_new[old_idx] = len(rebuilt)
+        if old_idx in replace_with_nop:
+            rebuilt.append((ChironAST.NoOpCommand(), None))
+        else:
+            old_target = None
+            if isinstance(stmt, ChironAST.ConditionCommand):
+                old_target = old_idx + tgt
+            rebuilt.append((copy.deepcopy(stmt), old_target))
+
+        for inserted in insert_after.get(old_idx, []):
+            rebuilt.append((inserted, None))
+
+    old_to_new[len(ir)] = len(rebuilt)
+
+    new_ir = []
+    for new_idx, (stmt, old_target) in enumerate(rebuilt):
+        if isinstance(stmt, ChironAST.ConditionCommand):
+            if old_target is None:
+                new_tgt = 1
+            else:
+                old_target = max(0, min(old_target, len(ir)))
+                new_tgt = old_to_new[old_target] - new_idx
+            new_ir.append((stmt, new_tgt))
+        else:
+            new_ir.append((stmt, 1))
+
+    return new_ir
+
+
+def _apply_phase3_strength_reduction(ir, info):
+    rewrite_plan = None
+
+    for loop_info, loop in zip(info.loop_infos, info.loops):
+        plan = _phase3_rewrite_for_loop(ir, loop_info, loop)
+        if plan is not None:
+            if rewrite_plan is not None:
+                return ir
+            rewrite_plan = plan
+
+    if rewrite_plan is None:
+        return ir
+
+    return _rebuild_ir_with_indvar_rewrites(
+        ir,
+        rewrite_plan["insert_before"],
+        rewrite_plan["insert_after"],
+        rewrite_plan["replace_with_nop"],
+    )
+
+
 def run_indvar(ir, cfg, ssa_info, debug=False):
     info = collect_indvar_info(cfg, ssa_info)
     run_indvar.last_info = info
@@ -518,7 +831,7 @@ def run_indvar(ir, cfg, ssa_info, debug=False):
     if debug:
         dump_indvar_info(info)
 
-    return ir
+    return _apply_phase3_strength_reduction(ir, info)
 
 
 run_indvar.last_info = IndVarInfo()
