@@ -1,9 +1,9 @@
 """
-Phase 1 Global Value Numbering / Common Subexpression Elimination.
+Phase 1/2 Global Value Numbering / Common Subexpression Elimination.
 
-This pass currently performs detection only. It records conservative local
-common-subexpression candidates over straight-line CFG regions and leaves the
-IR unchanged.
+This pass records conservative local common-subexpression candidates over
+straight-line CFG regions, then performs a narrow local rewrite for safe
+repeated assignment expressions.
 """
 
 from collections import defaultdict
@@ -368,6 +368,97 @@ def dump_gvn_info(info):
     print("===========================\n")
 
 
+def _assignment_occurrence(ir, occurrence):
+    ir_index = occurrence.ir_index
+    if ir_index is None or ir_index < 0 or ir_index >= len(ir):
+        return None
+
+    instr = ir[ir_index][0]
+    if not isinstance(instr, ChironAST.AssignmentCommand):
+        return None
+    if not isinstance(instr.lvar, ChironAST.Var):
+        return None
+    if instr.lvar.varname != occurrence.target:
+        return None
+    if str(instr.rexpr) != occurrence.expression:
+        return None
+
+    return instr
+
+
+def _target_var(instr):
+    if isinstance(instr, ChironAST.AssignmentCommand) and isinstance(
+        instr.lvar, ChironAST.Var
+    ):
+        return instr.lvar.varname
+    return None
+
+
+def _var_redefined_between(ir, varname, first_index, later_index):
+    if first_index is None or later_index is None or later_index <= first_index:
+        return True
+
+    for ir_index in range(first_index + 1, later_index):
+        if _target_var(ir[ir_index][0]) == varname:
+            return True
+
+    return False
+
+
+def _rewrite_candidate(ir, new_ir, candidate):
+    if candidate.op not in {"+", "-", "*"}:
+        return False
+
+    first = candidate.first_occurrence
+    first_instr = _assignment_occurrence(ir, first)
+    if first_instr is None:
+        return False
+
+    first_target = _target_var(first_instr)
+    if first_target is None:
+        return False
+
+    changed = False
+    for occurrence in candidate.later_occurrences:
+        later_instr = _assignment_occurrence(ir, occurrence)
+        if later_instr is None:
+            continue
+        if _assignment_occurrence(new_ir, occurrence) is None:
+            continue
+
+        later_target = _target_var(later_instr)
+        if later_target is None or later_target == first_target:
+            continue
+        if _var_redefined_between(
+            ir, first_target, first.ir_index, occurrence.ir_index
+        ):
+            continue
+
+        new_ir[occurrence.ir_index] = (
+            ChironAST.AssignmentCommand(
+                later_instr.lvar, ChironAST.Var(first_target)
+            ),
+            ir[occurrence.ir_index][1],
+        )
+        changed = True
+
+    return changed
+
+
+def _apply_local_cse(ir, info):
+    if not info.candidates:
+        return ir
+
+    new_ir = list(ir)
+    changed = False
+
+    for candidate in info.candidates:
+        if _rewrite_candidate(ir, new_ir, candidate):
+            changed = True
+
+    return new_ir if changed else ir
+
+
 def run_gvn(ir, cfg, ssa_info, debug=False):
     info = collect_gvn_info(ir, cfg, ssa_info)
     run_gvn.last_info = info
@@ -375,7 +466,7 @@ def run_gvn(ir, cfg, ssa_info, debug=False):
     if debug:
         dump_gvn_info(info)
 
-    return ir
+    return _apply_local_cse(ir, info)
 
 
 run_gvn.last_info = GVNInfo()
