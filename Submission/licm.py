@@ -1,10 +1,9 @@
 """
-Loop Invariant Code Motion (LICM) scaffolding.
-
-This step is analysis-only: detect natural loops and possible preheader
-predecessors, but do not rewrite the IR yet.
+Loop Invariant Code Motion (LICM).
 """
 
+import copy
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional
 
@@ -202,8 +201,99 @@ def dump_loops(loops):
     print("==============================\n")
 
 
+def _is_safe_hoist_assignment(instr):
+    if not isinstance(instr, ChironAST.AssignmentCommand):
+        return False
+    if _is_rep_counter(instr.lvar.varname):
+        return False
+    if _contains_div(instr.rexpr):
+        return False
+    return True
+
+
+def _preheader_insertion_index(ir, loop):
+    """Return old IR index where preheader-only hoists should be inserted."""
+    preheader = loop.dedicated_preheader
+    if preheader is None:
+        return None
+
+    preheader_idx = get_block_ir_idx(preheader)
+    header_idx = get_block_ir_idx(loop.header)
+    if preheader_idx is None or header_idx is None:
+        return None
+    if preheader_idx < 0 or preheader_idx >= len(ir):
+        return None
+
+    preheader_instr, preheader_tgt = ir[preheader_idx]
+    if isinstance(preheader_instr, ChironAST.ConditionCommand):
+        return None
+    if preheader_tgt != 1:
+        return None
+    if preheader_idx + 1 != header_idx:
+        return None
+
+    return header_idx
+
+
+def _collect_hoists(ir, loops):
+    insertions = defaultdict(list)
+    replace_with_nop = set()
+
+    for loop in loops:
+        insertion_idx = _preheader_insertion_index(ir, loop)
+        if insertion_idx is None:
+            continue
+
+        for block in sorted(loop.invariant_candidate_blocks, key=_block_key):
+            instr = get_block_instr(block)
+            old_idx = get_block_ir_idx(block)
+            if old_idx is None or old_idx in replace_with_nop:
+                continue
+            if not _is_safe_hoist_assignment(instr):
+                continue
+
+            insertions[insertion_idx].append(copy.deepcopy(instr))
+            replace_with_nop.add(old_idx)
+
+    return insertions, replace_with_nop
+
+
+def _rebuild_ir_with_hoists(ir, insertions, replace_with_nop):
+    old_to_new = {}
+    rebuilt = []
+
+    for old_idx, (stmt, tgt) in enumerate(ir):
+        for hoisted_instr in insertions.get(old_idx, []):
+            rebuilt.append((hoisted_instr, None))
+
+        old_to_new[old_idx] = len(rebuilt)
+        if old_idx in replace_with_nop:
+            rebuilt.append((ChironAST.NoOpCommand(), None))
+        else:
+            old_target = None
+            if isinstance(stmt, ChironAST.ConditionCommand):
+                old_target = old_idx + tgt
+            rebuilt.append((copy.deepcopy(stmt), old_target))
+
+    old_to_new[len(ir)] = len(rebuilt)
+
+    new_ir = []
+    for new_idx, (stmt, old_target) in enumerate(rebuilt):
+        if isinstance(stmt, ChironAST.ConditionCommand):
+            if old_target is None:
+                new_tgt = 1
+            else:
+                old_target = max(0, min(old_target, len(ir)))
+                new_tgt = old_to_new[old_target] - new_idx
+            new_ir.append((stmt, new_tgt))
+        else:
+            new_ir.append((stmt, 1))
+
+    return new_ir
+
+
 def run_licm(ir, cfg, ssa_info, debug=False):
-    """Run LICM analysis scaffolding and return IR unchanged."""
+    """Run conservative LICM and return the rewritten IR."""
     loops = find_loops(cfg, ssa_info)
     run_licm.last_loops = loops
     run_licm.last_invariant_candidates = [
@@ -213,7 +303,11 @@ def run_licm(ir, cfg, ssa_info, debug=False):
     if debug:
         dump_loops(loops)
 
-    return ir
+    insertions, replace_with_nop = _collect_hoists(ir, loops)
+    if not replace_with_nop:
+        return ir
+
+    return _rebuild_ir_with_hoists(ir, insertions, replace_with_nop)
 
 
 run_licm.last_loops = []
