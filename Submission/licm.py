@@ -8,6 +8,9 @@ predecessors, but do not rewrite the IR yet.
 from dataclasses import dataclass
 from typing import Optional
 
+import ChironAST.ChironAST as ChironAST
+from ssa import get_block_instr, get_block_ir_idx, vars_in_expr
+
 
 @dataclass(frozen=True)
 class LoopInfo:
@@ -18,6 +21,7 @@ class LoopInfo:
     blocks: frozenset
     preheader_candidates: frozenset
     dedicated_preheader: Optional[object]
+    invariant_candidate_blocks: frozenset
 
 
 def _block_key(block):
@@ -64,6 +68,71 @@ def _natural_loop(cfg, header, tail, reachable_blocks):
     return loop_blocks
 
 
+def _contains_div(expr):
+    if isinstance(expr, ChironAST.Div):
+        return True
+    if isinstance(expr, (ChironAST.BinArithOp, ChironAST.BinCondOp)):
+        return _contains_div(expr.lexpr) or _contains_div(expr.rexpr)
+    if isinstance(expr, (ChironAST.UnaryArithOp, ChironAST.NOT)):
+        return _contains_div(expr.expr)
+    return False
+
+
+def _is_rep_counter(varname):
+    return varname.startswith(":__rep_counter_") or varname.startswith("__rep_counter_")
+
+
+def _assignment_candidate_blocks(loop_blocks):
+    candidates = []
+    for block in loop_blocks:
+        instr = get_block_instr(block)
+        if not isinstance(instr, ChironAST.AssignmentCommand):
+            continue
+        if _is_rep_counter(instr.lvar.varname):
+            continue
+        if _contains_div(instr.rexpr):
+            continue
+        candidates.append(block)
+    return candidates
+
+
+def _rhs_uses_are_loop_invariant(block, instr, loop_blocks, invariant_blocks, ssa_info):
+    for var in vars_in_expr(instr.rexpr):
+        ver = ssa_info.var_version_use.get((var, block))
+        if ver is None or ver == -1:
+            return False
+
+        def_block = ssa_info.def_site.get((var, ver))
+        if def_block is None:
+            return False
+        if def_block not in loop_blocks:
+            continue
+        if def_block in invariant_blocks:
+            continue
+        return False
+    return True
+
+
+def find_invariant_candidates(loop_blocks, ssa_info):
+    """Find assignment blocks whose RHS is loop-invariant by SSA def-sites."""
+    remaining = set(_assignment_candidate_blocks(loop_blocks))
+    invariant_blocks = set()
+
+    changed = True
+    while changed:
+        changed = False
+        for block in list(remaining):
+            instr = get_block_instr(block)
+            if _rhs_uses_are_loop_invariant(
+                block, instr, loop_blocks, invariant_blocks, ssa_info
+            ):
+                remaining.remove(block)
+                invariant_blocks.add(block)
+                changed = True
+
+    return frozenset(invariant_blocks)
+
+
 def find_loops(cfg, ssa_info):
     """Detect natural loops from CFG backedges.
 
@@ -94,6 +163,8 @@ def find_loops(cfg, ssa_info):
             if candidate_succs == {header}:
                 dedicated_preheader = candidate
 
+        invariant_candidate_blocks = find_invariant_candidates(loop_blocks, ssa_info)
+
         loops.append(
             LoopInfo(
                 header=header,
@@ -101,6 +172,7 @@ def find_loops(cfg, ssa_info):
                 blocks=frozenset(loop_blocks),
                 preheader_candidates=frozenset(preheader_candidates),
                 dedicated_preheader=dedicated_preheader,
+                invariant_candidate_blocks=invariant_candidate_blocks,
             )
         )
 
@@ -121,8 +193,12 @@ def dump_loops(loops):
             f"backedge {loop.tail.name} -> {loop.header.name}; "
             f"blocks={_block_names(loop.blocks)}; "
             f"preheader_candidates={preheaders}; "
-            f"dedicated_preheader={dedicated}"
+            f"dedicated_preheader={dedicated}; "
+            f"invariant_candidates={_block_names(loop.invariant_candidate_blocks)}"
         )
+        for block in sorted(loop.invariant_candidate_blocks, key=_block_key):
+            instr = get_block_instr(block)
+            print(f"    [{block.name}] ir[{get_block_ir_idx(block)}] {instr}")
     print("==============================\n")
 
 
@@ -130,6 +206,9 @@ def run_licm(ir, cfg, ssa_info, debug=False):
     """Run LICM analysis scaffolding and return IR unchanged."""
     loops = find_loops(cfg, ssa_info)
     run_licm.last_loops = loops
+    run_licm.last_invariant_candidates = [
+        loop.invariant_candidate_blocks for loop in loops
+    ]
 
     if debug:
         dump_loops(loops)
@@ -138,3 +217,4 @@ def run_licm(ir, cfg, ssa_info, debug=False):
 
 
 run_licm.last_loops = []
+run_licm.last_invariant_candidates = []
