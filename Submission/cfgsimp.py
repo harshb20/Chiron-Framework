@@ -1,9 +1,9 @@
 """
-CFG simplification phase 0.
+CFG simplification.
 
-This pass is detection-only: it rebuilds no IR and performs no CFG or IR
-rewrites.  It records conservative simplification opportunities for later
-phases.
+Phase 0 records conservative simplification opportunities.  Phase 1 performs
+only literal-constant branch collapse and removes blocks made unreachable by
+those collapsed branch choices.
 """
 
 from dataclasses import dataclass, field
@@ -34,6 +34,32 @@ def _block_names(blocks):
     return [block.name for block in sorted(blocks, key=_block_key)]
 
 
+def _constant_condition_taken_label(instr):
+    if not isinstance(instr, ChironAST.ConditionCommand):
+        return None
+    if isinstance(instr.cond, ChironAST.BoolTrue):
+        return "Cond_True"
+    if isinstance(instr.cond, ChironAST.BoolFalse):
+        return "Cond_False"
+    return None
+
+
+def _successors_with_label(cfg, block, label):
+    return [
+        succ
+        for succ in cfg.successors(block)
+        if cfg.get_edge_label(block, succ) == label
+    ]
+
+
+def _phase1_successors(cfg, block):
+    instr, _ = _last_instr(block)
+    taken_label = _constant_condition_taken_label(instr)
+    if taken_label is None:
+        return list(cfg.successors(block))
+    return _successors_with_label(cfg, block, taken_label)
+
+
 def _reachable_blocks(cfg):
     starts = [block for block in cfg.nodes() if block.name == "START"]
     if not starts:
@@ -47,7 +73,7 @@ def _reachable_blocks(cfg):
         if block in reachable:
             continue
         reachable.add(block)
-        worklist.extend(cfg.successors(block))
+        worklist.extend(_phase1_successors(cfg, block))
 
     return reachable
 
@@ -168,6 +194,123 @@ def collect_cfg_simplify_info(ir, cfg):
     return info
 
 
+def _first_instr_index(block):
+    if block.instrlist:
+        return min(ir_idx for _, ir_idx in block.instrlist)
+    return _block_key(block)
+
+
+def _ordered_instr_blocks(blocks):
+    return sorted(
+        [block for block in blocks if block.instrlist],
+        key=_first_instr_index,
+    )
+
+
+def _successor_new_index(successor, block_to_new_start, new_len):
+    if successor.name == "END":
+        return new_len
+    return block_to_new_start.get(successor)
+
+
+def _has_phase1_rewrite_opportunity(info, reachable):
+    for item in info.constant_condition_blocks:
+        if item["block"] in reachable and len(item["kept_edges"]) == 1:
+            return True
+    return False
+
+
+def _validate_constant_conditions(info, reachable):
+    for item in info.constant_condition_blocks:
+        if item["block"] not in reachable:
+            continue
+        if len(item["kept_edges"]) != 1:
+            return False
+    return True
+
+
+def _rebuild_ir_phase1(ir, cfg, reachable, info):
+    if not _has_phase1_rewrite_opportunity(info, reachable):
+        return ir
+    if not _validate_constant_conditions(info, reachable):
+        return ir
+
+    ordered_blocks = _ordered_instr_blocks(reachable)
+    kept = []
+    block_to_new_start = {}
+    block_to_new_end = {}
+
+    for block in ordered_blocks:
+        instrs = sorted(block.instrlist, key=lambda item: item[1])
+        block_to_new_start[block] = len(kept)
+        for instr, _ in instrs:
+            kept.append((block, instr))
+        block_to_new_end[block] = len(kept) - 1
+
+    new_len = len(kept)
+    new_ir = []
+
+    for new_idx, (block, instr) in enumerate(kept):
+        is_block_end = new_idx == block_to_new_end[block]
+
+        if isinstance(instr, ChironAST.ConditionCommand):
+            if not is_block_end:
+                return ir
+
+            if isinstance(instr.cond, ChironAST.BoolTrue):
+                true_succs = _successors_with_label(cfg, block, "Cond_True")
+                if len(true_succs) != 1:
+                    return ir
+
+                true_idx = _successor_new_index(
+                    true_succs[0], block_to_new_start, new_len
+                )
+                if true_idx is None or true_idx != new_idx + 1:
+                    return ir
+
+                new_ir.append((instr, 1))
+                continue
+
+            false_succs = _successors_with_label(cfg, block, "Cond_False")
+            if len(false_succs) != 1:
+                return ir
+
+            false_idx = _successor_new_index(
+                false_succs[0], block_to_new_start, new_len
+            )
+            if false_idx is None:
+                return ir
+
+            if not isinstance(instr.cond, ChironAST.BoolFalse):
+                true_succs = _successors_with_label(cfg, block, "Cond_True")
+                if len(true_succs) != 1:
+                    return ir
+
+                true_idx = _successor_new_index(
+                    true_succs[0], block_to_new_start, new_len
+                )
+                if true_idx is None or true_idx != new_idx + 1:
+                    return ir
+
+            new_ir.append((instr, false_idx - new_idx))
+            continue
+
+        if is_block_end:
+            flow_succs = _successors_with_label(cfg, block, "flow_edge")
+            if len(flow_succs) != 1:
+                return ir
+
+            flow_idx = _successor_new_index(
+                flow_succs[0], block_to_new_start, new_len
+            )
+            if flow_idx is None or flow_idx != new_idx + 1:
+                return ir
+
+        new_ir.append((instr, 1))
+
+    return new_ir
+
+
 def dump_cfg_simplify_info(info):
     print("\n===== CFG SIMPLIFICATION OPPORTUNITIES =====")
     print(f"  unreachable_blocks={_block_names(info.unreachable_blocks)}")
@@ -219,7 +362,8 @@ def run_cfg_simplify(ir, cfg, debug=False):
     if debug:
         dump_cfg_simplify_info(info)
 
-    return ir
+    reachable = set(cfg.nodes()) - info.unreachable_blocks
+    return _rebuild_ir_phase1(ir, cfg, reachable, info)
 
 
 run_cfg_simplify.last_info = CFGSimpInfo()
