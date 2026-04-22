@@ -223,12 +223,34 @@ def _effective_successor(cfg, successor, removed_blocks):
             return None
         seen.add(current)
 
-        flow_succs = _successors_with_label(cfg, current, "flow_edge")
-        if len(flow_succs) != 1:
+        next_succ = _removed_block_successor(cfg, current)
+        if next_succ is None:
             return None
-        current = flow_succs[0]
+        current = next_succ
 
     return current
+
+
+def _removed_block_successor(cfg, block):
+    if _is_nop_only(block):
+        flow_succs = _successors_with_label(cfg, block, "flow_edge")
+        if len(flow_succs) != 1:
+            return None
+        return flow_succs[0]
+
+    instr, _ = _last_instr(block)
+    taken_label = _constant_condition_taken_label(instr)
+    if taken_label is None:
+        return None
+
+    # A removable constant marker must already have collapsed to one live edge.
+    if len(list(cfg.successors(block))) != 1:
+        return None
+
+    succs = _successors_with_label(cfg, block, taken_label)
+    if len(succs) != 1:
+        return None
+    return succs[0]
 
 
 def _effective_successor_new_index(
@@ -256,10 +278,71 @@ def _validate_constant_conditions(info, reachable):
     return True
 
 
+def _has_only_local_reachable_predecessors(
+    cfg, block, reachable, removed_blocks, order
+):
+    try:
+        block_pos = order.index(block)
+    except ValueError:
+        return False
+
+    expected_pred = order[block_pos - 1] if block_pos > 0 else None
+    for pred in cfg.predecessors(block):
+        if pred not in reachable:
+            continue
+        if pred in removed_blocks:
+            return False
+        if pred != expected_pred:
+            return False
+
+    return True
+
+
+def _find_redundant_constant_marker_blocks(cfg, reachable, removed_blocks):
+    ordered_blocks = _ordered_instr_blocks(set(reachable) - set(removed_blocks))
+    redundant = set()
+
+    for idx, block in enumerate(ordered_blocks):
+        instr, _ = _last_instr(block)
+        if _constant_condition_taken_label(instr) is None:
+            continue
+
+        if len(block.instrlist) != 1:
+            continue
+
+        successor = _removed_block_successor(cfg, block)
+        if successor is None:
+            continue
+
+        effective_successor = _effective_successor(cfg, successor, removed_blocks)
+        if effective_successor is None:
+            continue
+
+        next_block = ordered_blocks[idx + 1] if idx + 1 < len(ordered_blocks) else None
+        if next_block is None:
+            if effective_successor.name != "END":
+                continue
+        elif effective_successor != next_block:
+            continue
+
+        if not _has_only_local_reachable_predecessors(
+            cfg, block, reachable, removed_blocks, ordered_blocks
+        ):
+            continue
+
+        redundant.add(block)
+
+    return redundant
+
+
 def _rebuild_ir_cfgsimp(ir, cfg, reachable, info):
     # Phase 2 candidates are the already-detected reachable NOP-only
     # flow-through blocks.  Any ambiguous edge rewrite below aborts the rebuild.
     removed_blocks = set(info.fallthrough_only_blocks)
+    constant_marker_blocks = _find_redundant_constant_marker_blocks(
+        cfg, reachable, removed_blocks
+    )
+    removed_blocks.update(constant_marker_blocks)
     has_phase1_rewrite = _has_phase1_rewrite_opportunity(info, reachable)
 
     if not has_phase1_rewrite and not removed_blocks:
