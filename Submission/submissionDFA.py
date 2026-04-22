@@ -295,6 +295,16 @@ def apply_sccp(ir, cfg, ssa_info, sccp_result):
 def apply_adce(ir, cfg, ssa_info, live_blocks, executable_blocks):
     new_ir = list(ir)
 
+    def can_nop(instr):
+        if isinstance(instr, ChironAST.AssignmentCommand):
+            return "__rep_counter_" not in str(instr.lvar)
+        return isinstance(instr, (
+            ChironAST.MoveCommand,
+            ChironAST.GotoCommand,
+            ChironAST.PenCommand,
+            ChironAST.PauseCommand,
+        ))
+
     for block in cfg.nodes():
         if block.name in ("START", "END"):
             continue
@@ -303,15 +313,13 @@ def apply_adce(ir, cfg, ssa_info, live_blocks, executable_blocks):
         instr, orig_idx = block.instrlist[0]
 
         if block not in executable_blocks:
-            if isinstance(instr, ChironAST.AssignmentCommand):
-                if "__rep_counter_" not in str(instr.lvar):
-                    new_ir[orig_idx] = (ChironAST.NoOpCommand(), 1)
+            if can_nop(instr):
+                new_ir[orig_idx] = (ChironAST.NoOpCommand(), 1)
             continue
 
         if block not in live_blocks:
-            if isinstance(instr, ChironAST.AssignmentCommand):
-                if "__rep_counter_" not in str(instr.lvar):
-                    new_ir[orig_idx] = (ChironAST.NoOpCommand(), 1)
+            if can_nop(instr):
+                new_ir[orig_idx] = (ChironAST.NoOpCommand(), 1)
 
     return new_ir
 
