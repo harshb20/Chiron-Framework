@@ -369,6 +369,10 @@ def rebuild_cfg_and_ssa(ir, name="opt_cfg"):
     return cfg, ssa_info
 
 
+def _ir_signature(ir):
+    return [(type(stmt).__name__, str(stmt), tgt) for stmt, tgt in ir]
+
+
 def optimize(irHandler, args):
     ir = copy.deepcopy(irHandler.ir)
 
@@ -414,7 +418,14 @@ def optimize(irHandler, args):
 
     if do_indvar:
         cfg, ssa_info = rebuild_cfg_and_ssa(ir, "opt_cfg_indvar")
-        ir = run_indvar(ir, cfg, ssa_info)
+        old_ir_signature = _ir_signature(ir)
+        indvar_ir = run_indvar(ir, cfg, ssa_info)
+
+        if _ir_signature(indvar_ir) != old_ir_signature:
+            cfg = cfgB.buildCFG(indvar_ir, "opt_cfg_indvar_cfgsimp", isSingle=True)
+            ir = run_cfg_simplify(indvar_ir, cfg)
+        else:
+            ir = indvar_ir
 
     if do_adce:
         cfg, ssa_info = rebuild_cfg_and_ssa(ir, "opt_cfg_adce")
