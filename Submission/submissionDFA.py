@@ -17,6 +17,7 @@ from adce import run_adce, dump_adce
 from licm import run_licm
 from cfgsimp import run_cfg_simplify
 from indvar import run_indvar
+from gvn import run_gvn
 
 
 '''
@@ -382,6 +383,7 @@ def optimize(irHandler, args):
     do_licm = getattr(args, "opt_licm", False) or args.opt_all
     do_cfgsimp = getattr(args, "opt_cfgsimp", False) or args.opt_all
     do_indvar = getattr(args, "opt_indvar", False) or args.opt_all
+    do_gvn = getattr(args, "opt_gvn", False) or args.opt_all
     do_adce = args.opt_dce or args.opt_all
 
     if not (
@@ -391,6 +393,7 @@ def optimize(irHandler, args):
         or do_licm
         or do_cfgsimp
         or do_indvar
+        or do_gvn
         or do_adce
     ):
         return irHandler.ir
@@ -426,6 +429,10 @@ def optimize(irHandler, args):
             ir = run_cfg_simplify(indvar_ir, cfg)
         else:
             ir = indvar_ir
+
+    if do_gvn:
+        cfg, ssa_info = rebuild_cfg_and_ssa(ir, "opt_cfg_gvn")
+        ir = run_gvn(ir, cfg, ssa_info)
 
     if do_adce:
         cfg, ssa_info = rebuild_cfg_and_ssa(ir, "opt_cfg_adce")
