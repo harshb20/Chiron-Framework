@@ -16,6 +16,7 @@ from sccp import SCCP, ConstVal, OVERDEF, UNDEF
 from adce import run_adce, dump_adce
 from licm import run_licm
 from cfgsimp import run_cfg_simplify
+from indvar import run_indvar
 
 
 '''
@@ -376,9 +377,18 @@ def optimize(irHandler, args):
     do_sccp = args.opt_constprop or args.opt_all
     do_licm = getattr(args, "opt_licm", False) or args.opt_all
     do_cfgsimp = getattr(args, "opt_cfgsimp", False) or args.opt_all
+    do_indvar = getattr(args, "opt_indvar", False) or args.opt_all
     do_adce = args.opt_dce or args.opt_all
 
-    if not (do_fold or do_simp or do_sccp or do_licm or do_cfgsimp or do_adce):
+    if not (
+        do_fold
+        or do_simp
+        or do_sccp
+        or do_licm
+        or do_cfgsimp
+        or do_indvar
+        or do_adce
+    ):
         return irHandler.ir
 
     if do_fold or do_simp:
@@ -401,6 +411,10 @@ def optimize(irHandler, args):
     if do_cfgsimp:
         cfg = cfgB.buildCFG(ir, "opt_cfg_cfgsimp", isSingle=True)
         ir = run_cfg_simplify(ir, cfg)
+
+    if do_indvar:
+        cfg, ssa_info = rebuild_cfg_and_ssa(ir, "opt_cfg_indvar")
+        ir = run_indvar(ir, cfg, ssa_info)
 
     if do_adce:
         cfg, ssa_info = rebuild_cfg_and_ssa(ir, "opt_cfg_adce")
