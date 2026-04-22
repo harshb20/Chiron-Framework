@@ -75,6 +75,7 @@ _BINOP_INFO = (
     (ChironAST.Sum, "+", True),
     (ChironAST.Diff, "-", False),
     (ChironAST.Mult, "*", True),
+    (ChironAST.Div, "/", False),
 )
 
 
@@ -114,9 +115,6 @@ def _operand_key(expr, block, ssa_info):
 
 
 def _expr_key(expr, block, ssa_info):
-    if _contains_div(expr):
-        return None, None, frozenset(), "contains Div"
-
     for cls, op, commutative in _BINOP_INFO:
         if not isinstance(expr, cls):
             continue
@@ -406,7 +404,7 @@ def _var_redefined_between(ir, varname, first_index, later_index):
 
 
 def _rewrite_candidate(ir, new_ir, candidate):
-    if candidate.op not in {"+", "-", "*"}:
+    if candidate.op not in {"+", "-", "*", "/"}:
         return False
 
     first = candidate.first_occurrence
