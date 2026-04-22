@@ -2,8 +2,9 @@
 CFG simplification.
 
 Phase 0 records conservative simplification opportunities.  Phase 1 performs
-only literal-constant branch collapse and removes blocks made unreachable by
-those collapsed branch choices.
+literal-constant branch collapse and removes blocks made unreachable by those
+collapsed branch choices.  Phase 2 removes reachable NOP-only flow-through
+connector blocks.
 """
 
 from dataclasses import dataclass, field
@@ -213,6 +214,32 @@ def _successor_new_index(successor, block_to_new_start, new_len):
     return block_to_new_start.get(successor)
 
 
+def _effective_successor(cfg, successor, removed_blocks):
+    seen = set()
+    current = successor
+
+    while current in removed_blocks:
+        if current in seen:
+            return None
+        seen.add(current)
+
+        flow_succs = _successors_with_label(cfg, current, "flow_edge")
+        if len(flow_succs) != 1:
+            return None
+        current = flow_succs[0]
+
+    return current
+
+
+def _effective_successor_new_index(
+    cfg, successor, removed_blocks, block_to_new_start, new_len
+):
+    successor = _effective_successor(cfg, successor, removed_blocks)
+    if successor is None:
+        return None
+    return _successor_new_index(successor, block_to_new_start, new_len)
+
+
 def _has_phase1_rewrite_opportunity(info, reachable):
     for item in info.constant_condition_blocks:
         if item["block"] in reachable and len(item["kept_edges"]) == 1:
@@ -229,13 +256,19 @@ def _validate_constant_conditions(info, reachable):
     return True
 
 
-def _rebuild_ir_phase1(ir, cfg, reachable, info):
-    if not _has_phase1_rewrite_opportunity(info, reachable):
+def _rebuild_ir_cfgsimp(ir, cfg, reachable, info):
+    # Phase 2 candidates are the already-detected reachable NOP-only
+    # flow-through blocks.  Any ambiguous edge rewrite below aborts the rebuild.
+    removed_blocks = set(info.fallthrough_only_blocks)
+    has_phase1_rewrite = _has_phase1_rewrite_opportunity(info, reachable)
+
+    if not has_phase1_rewrite and not removed_blocks:
         return ir
     if not _validate_constant_conditions(info, reachable):
         return ir
 
-    ordered_blocks = _ordered_instr_blocks(reachable)
+    kept_blocks = set(reachable) - removed_blocks
+    ordered_blocks = _ordered_instr_blocks(kept_blocks)
     kept = []
     block_to_new_start = {}
     block_to_new_end = {}
@@ -262,8 +295,8 @@ def _rebuild_ir_phase1(ir, cfg, reachable, info):
                 if len(true_succs) != 1:
                     return ir
 
-                true_idx = _successor_new_index(
-                    true_succs[0], block_to_new_start, new_len
+                true_idx = _effective_successor_new_index(
+                    cfg, true_succs[0], removed_blocks, block_to_new_start, new_len
                 )
                 if true_idx is None or true_idx != new_idx + 1:
                     return ir
@@ -275,8 +308,8 @@ def _rebuild_ir_phase1(ir, cfg, reachable, info):
             if len(false_succs) != 1:
                 return ir
 
-            false_idx = _successor_new_index(
-                false_succs[0], block_to_new_start, new_len
+            false_idx = _effective_successor_new_index(
+                cfg, false_succs[0], removed_blocks, block_to_new_start, new_len
             )
             if false_idx is None:
                 return ir
@@ -286,8 +319,8 @@ def _rebuild_ir_phase1(ir, cfg, reachable, info):
                 if len(true_succs) != 1:
                     return ir
 
-                true_idx = _successor_new_index(
-                    true_succs[0], block_to_new_start, new_len
+                true_idx = _effective_successor_new_index(
+                    cfg, true_succs[0], removed_blocks, block_to_new_start, new_len
                 )
                 if true_idx is None or true_idx != new_idx + 1:
                     return ir
@@ -300,8 +333,8 @@ def _rebuild_ir_phase1(ir, cfg, reachable, info):
             if len(flow_succs) != 1:
                 return ir
 
-            flow_idx = _successor_new_index(
-                flow_succs[0], block_to_new_start, new_len
+            flow_idx = _effective_successor_new_index(
+                cfg, flow_succs[0], removed_blocks, block_to_new_start, new_len
             )
             if flow_idx is None or flow_idx != new_idx + 1:
                 return ir
@@ -363,7 +396,7 @@ def run_cfg_simplify(ir, cfg, debug=False):
         dump_cfg_simplify_info(info)
 
     reachable = set(cfg.nodes()) - info.unreachable_blocks
-    return _rebuild_ir_phase1(ir, cfg, reachable, info)
+    return _rebuild_ir_cfgsimp(ir, cfg, reachable, info)
 
 
 run_cfg_simplify.last_info = CFGSimpInfo()
