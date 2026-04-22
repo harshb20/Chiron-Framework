@@ -410,6 +410,9 @@ def _rewrite_candidate(ir, new_ir, candidate):
         return False
 
     first = candidate.first_occurrence
+    if first.expression_key != candidate.expression_key:
+        return False
+
     first_instr = _assignment_occurrence(ir, first)
     if first_instr is None:
         return False
@@ -420,6 +423,9 @@ def _rewrite_candidate(ir, new_ir, candidate):
 
     changed = False
     for occurrence in candidate.later_occurrences:
+        if occurrence.expression_key != candidate.expression_key:
+            continue
+
         later_instr = _assignment_occurrence(ir, occurrence)
         if later_instr is None:
             continue
