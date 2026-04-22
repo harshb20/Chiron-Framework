@@ -1,5 +1,5 @@
 """
-Phase 0 Global Value Numbering / Common Subexpression Elimination.
+Phase 1 Global Value Numbering / Common Subexpression Elimination.
 
 This pass currently performs detection only. It records conservative local
 common-subexpression candidates over straight-line CFG regions and leaves the
@@ -19,7 +19,10 @@ class CSEOccurrence:
     block_name: str
     ir_index: int
     target: str
+    target_version: int
     expression: str
+    expression_key: tuple
+    operand_versions: tuple
     instr: object
 
 
@@ -30,6 +33,26 @@ class CSECandidate:
     op: str
     expression: str
     occurrences: tuple
+
+    @property
+    def first_occurrence(self):
+        return self.occurrences[0]
+
+    @property
+    def later_occurrences(self):
+        return self.occurrences[1:]
+
+    @property
+    def first_ir_index(self):
+        return self.first_occurrence.ir_index
+
+    @property
+    def later_ir_indices(self):
+        return tuple(occ.ir_index for occ in self.later_occurrences)
+
+    @property
+    def destination_vars(self):
+        return tuple(occ.target for occ in self.occurrences)
 
 
 @dataclass(frozen=True)
@@ -79,15 +102,15 @@ def _contains_div(expr):
 
 def _operand_key(expr, block, ssa_info):
     if isinstance(expr, ChironAST.Num):
-        return ("num", expr.val), frozenset()
+        return ("num", expr.val), frozenset(), None
 
     if isinstance(expr, ChironAST.Var):
         version = ssa_info.var_version_use.get((expr.varname, block))
-        if version is None:
-            return None, frozenset()
-        return ("var", expr.varname, version), frozenset({expr.varname})
+        if version is None or version < 0:
+            return None, frozenset(), "missing operand version"
+        return ("var", expr.varname, version), frozenset({expr.varname}), None
 
-    return None, frozenset()
+    return None, frozenset(), "unsupported operand"
 
 
 def _expr_key(expr, block, ssa_info):
@@ -98,10 +121,13 @@ def _expr_key(expr, block, ssa_info):
         if not isinstance(expr, cls):
             continue
 
-        left_key, left_vars = _operand_key(expr.lexpr, block, ssa_info)
-        right_key, right_vars = _operand_key(expr.rexpr, block, ssa_info)
-        if left_key is None or right_key is None:
-            return None, op, frozenset(), "unsupported operand"
+        left_key, left_vars, left_reason = _operand_key(expr.lexpr, block, ssa_info)
+        if left_key is None:
+            return None, op, frozenset(), f"left {left_reason}"
+
+        right_key, right_vars, right_reason = _operand_key(expr.rexpr, block, ssa_info)
+        if right_key is None:
+            return None, op, frozenset(), f"right {right_reason}"
 
         operands = (left_key, right_key)
         if commutative:
@@ -163,6 +189,12 @@ def _straight_line_regions(cfg, ssa_info):
     return tuple(regions)
 
 
+def _invalidate_active_defs(active, defined_var):
+    for active_key, (_, active_operand_vars) in list(active.items()):
+        if defined_var in active_operand_vars:
+            del active[active_key]
+
+
 def collect_gvn_info(ir, cfg, ssa_info):
     regions = _straight_line_regions(cfg, ssa_info)
     skipped = []
@@ -185,12 +217,27 @@ def collect_gvn_info(ir, cfg, ssa_info):
                 active.clear()
                 continue
 
+            defined_var = instr.lvar.varname
+            target_version = ssa_info.instr_version_def.get((defined_var, block))
+            if target_version is None:
+                skipped.append(
+                    GVNSkip(
+                        region_id,
+                        block_name,
+                        ir_index,
+                        "missing target version",
+                        str(instr.lvar),
+                    )
+                )
+                active.clear()
+                continue
+
             key, op, operand_vars, reason = _expr_key(instr.rexpr, block, ssa_info)
             if key is None:
                 skipped.append(
                     GVNSkip(region_id, block_name, ir_index, reason, str(instr.rexpr))
                 )
-                active.clear()
+                _invalidate_active_defs(active, defined_var)
                 continue
 
             occurrence = CSEOccurrence(
@@ -198,7 +245,12 @@ def collect_gvn_info(ir, cfg, ssa_info):
                 block_name=block_name,
                 ir_index=ir_index,
                 target=str(instr.lvar),
+                target_version=target_version,
                 expression=str(instr.rexpr),
+                expression_key=key,
+                operand_versions=tuple(
+                    operand for operand in key[1:] if operand[0] == "var"
+                ),
                 instr=instr,
             )
 
@@ -216,10 +268,7 @@ def collect_gvn_info(ir, cfg, ssa_info):
                 group_id, _ = active[key]
                 groups[group_id]["occurrences"].append(occurrence)
 
-            defined_var = instr.lvar.varname
-            for active_key, (_, active_operand_vars) in list(active.items()):
-                if defined_var in active_operand_vars:
-                    del active[active_key]
+            _invalidate_active_defs(active, defined_var)
 
     candidates = []
     for group in groups.values():
@@ -252,30 +301,69 @@ def collect_gvn_info(ir, cfg, ssa_info):
     )
 
 
+def _format_occurrence(occ):
+    return (
+        f"{occ.target}_v{occ.target_version}@ir[{occ.ir_index}]"
+        f"/{occ.block_name}"
+    )
+
+
+def _skip_summary(skips):
+    skipped_by_reason = defaultdict(int)
+    for item in skips:
+        skipped_by_reason[item.reason] += 1
+    return ", ".join(
+        f"{reason}={count}" for reason, count in sorted(skipped_by_reason.items())
+    )
+
+
 def dump_gvn_info(info):
-    print("\n===== GVN/CSE PHASE 0 =====")
+    print("\n===== GVN/CSE PHASE 1 =====")
     print(f"  straight_line_regions={len(info.regions)}")
     print(f"  repeated_expression_candidates={len(info.candidates)}")
 
+    candidates_by_region = defaultdict(list)
     for candidate in info.candidates:
-        occs = ", ".join(
-            f"{occ.target}@ir[{occ.ir_index}]/{occ.block_name}"
-            for occ in candidate.occurrences
-        )
-        print(
-            "  "
-            f"region {candidate.region_id}: {candidate.expression} "
-            f"op={candidate.op}; occurrences={occs}"
-        )
+        candidates_by_region[candidate.region_id].append(candidate)
 
-    skipped_by_reason = defaultdict(int)
+    skips_by_region = defaultdict(list)
     for item in info.skipped:
-        skipped_by_reason[item.reason] += 1
-    if skipped_by_reason:
-        skipped_summary = ", ".join(
-            f"{reason}={count}" for reason, count in sorted(skipped_by_reason.items())
-        )
-        print(f"  skipped={skipped_summary}")
+        skips_by_region[item.region_id].append(item)
+
+    for region_id, region in enumerate(info.regions):
+        print(f"  region {region_id} blocks={list(region)}")
+
+        region_candidates = candidates_by_region.get(region_id, [])
+        if region_candidates:
+            for candidate in region_candidates:
+                first = candidate.first_occurrence
+                later = ", ".join(
+                    _format_occurrence(occ) for occ in candidate.later_occurrences
+                )
+                destinations = ", ".join(candidate.destination_vars)
+                print(
+                    "    candidate "
+                    f"op={candidate.op} expr={candidate.expression} "
+                    f"key={candidate.expression_key}"
+                )
+                print(f"      first={_format_occurrence(first)}")
+                print(f"      later={later}")
+                print(f"      destinations={destinations}")
+        else:
+            print("    candidates=none")
+
+        region_skips = skips_by_region.get(region_id, [])
+        if region_skips:
+            print(f"    skipped={_skip_summary(region_skips)}")
+            for item in region_skips:
+                print(
+                    "      skip "
+                    f"{item.reason}: ir[{item.ir_index}]/{item.block_name} "
+                    f"{item.detail}"
+                )
+
+    if info.skipped:
+        print(f"  skipped_total={_skip_summary(info.skipped)}")
 
     print("===========================\n")
 
