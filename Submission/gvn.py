@@ -139,6 +139,38 @@ def _expr_key(expr, block, ssa_info):
     return None, None, frozenset(), "unsupported RHS"
 
 
+def _operand_shape_key(expr):
+    if isinstance(expr, ChironAST.Num):
+        return ("num", expr.val)
+
+    if isinstance(expr, ChironAST.Var):
+        return ("var", expr.varname)
+
+    return None
+
+
+def _expr_shape_key(expr):
+    if _contains_div(expr):
+        return None
+
+    for cls, op, commutative in _BINOP_INFO:
+        if not isinstance(expr, cls):
+            continue
+
+        left_key = _operand_shape_key(expr.lexpr)
+        right_key = _operand_shape_key(expr.rexpr)
+        if left_key is None or right_key is None:
+            return None
+
+        operands = (left_key, right_key)
+        if commutative:
+            operands = tuple(sorted(operands, key=repr))
+
+        return (op,) + operands
+
+    return None
+
+
 def _single_flow_successor(cfg, block, reachable):
     succs = [succ for succ in cfg.successors(block) if succ in reachable]
     if len(succs) != 1:
@@ -380,7 +412,7 @@ def _assignment_occurrence(ir, occurrence):
         return None
     if instr.lvar.varname != occurrence.target:
         return None
-    if str(instr.rexpr) != occurrence.expression:
+    if _expr_shape_key(instr.rexpr) != _expr_shape_key(occurrence.instr.rexpr):
         return None
 
     return instr
