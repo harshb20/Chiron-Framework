@@ -160,6 +160,19 @@ def _ordered_blocks(cfg):
 
 
 @dataclass
+class ConditionIntervalResult:
+    """Interval-based classification for a ConditionCommand block."""
+
+    block_name: str
+    ir_index: Optional[int]
+    condition: Any
+    classification: str
+    lhs_interval: Optional[IntervalDomain] = None
+    rhs_interval: Optional[IntervalDomain] = None
+    operator: Optional[str] = None
+
+
+@dataclass
 class IntervalInfo:
     """Structured interval-analysis result for later optimizer phases."""
 
@@ -173,9 +186,17 @@ class IntervalInfo:
     visit_count: Dict[str, int] = field(default_factory=dict)
     iter_cap: Optional[int] = None
     widening_after: Optional[int] = None
+    condition_results: Dict[str, ConditionIntervalResult] = field(default_factory=dict)
 
     def ordered_blocks(self):
         return [self.block_map[name] for name in self.block_order if name in self.block_map]
+
+    def ordered_condition_results(self):
+        return [
+            self.condition_results[b.name]
+            for b in self.ordered_blocks()
+            if b.name in self.condition_results
+        ]
 
     def format_state(self, state):
         return _fmt_state(state)
@@ -341,6 +362,126 @@ class ForwardAnalysis():
         return result
 
 
+def _condition_result(
+    block,
+    classification,
+    lhs_interval=None,
+    rhs_interval=None,
+    operator=None,
+):
+    instr, ir_index = block.instrlist[0]
+    return ConditionIntervalResult(
+        block_name=block.name,
+        ir_index=ir_index,
+        condition=instr.cond,
+        classification=classification,
+        lhs_interval=lhs_interval,
+        rhs_interval=rhs_interval,
+        operator=operator,
+    )
+
+
+def _is_singleton(iv):
+    return not iv.isBot() and iv.low == iv.high
+
+
+def _is_disjoint(left, right):
+    return left.high < right.low or right.high < left.low
+
+
+def _classify_interval_comparison(cond, left, right):
+    if left.isBot() or right.isBot():
+        return "unknown"
+
+    if isinstance(cond, ChironAST.LT):
+        if left.high < right.low:
+            return "always_true"
+        if left.low >= right.high:
+            return "always_false"
+        return "unknown"
+
+    if isinstance(cond, ChironAST.LTE):
+        if left.high <= right.low:
+            return "always_true"
+        if left.low > right.high:
+            return "always_false"
+        return "unknown"
+
+    if isinstance(cond, ChironAST.GT):
+        if left.low > right.high:
+            return "always_true"
+        if left.high <= right.low:
+            return "always_false"
+        return "unknown"
+
+    if isinstance(cond, ChironAST.GTE):
+        if left.low >= right.high:
+            return "always_true"
+        if left.high < right.low:
+            return "always_false"
+        return "unknown"
+
+    if isinstance(cond, ChironAST.EQ):
+        if _is_singleton(left) and _is_singleton(right) and left.low == right.low:
+            return "always_true"
+        if _is_disjoint(left, right):
+            return "always_false"
+        return "unknown"
+
+    if isinstance(cond, ChironAST.NEQ):
+        if _is_singleton(left) and _is_singleton(right) and left.low == right.low:
+            return "always_false"
+        if _is_disjoint(left, right):
+            return "always_true"
+        return "unknown"
+
+    return "unknown"
+
+
+def _classify_condition_block(block, in_state, evaluator):
+    instr = block.instrlist[0][0]
+    cond = instr.cond
+
+    if isinstance(cond, ChironAST.BoolTrue):
+        return _condition_result(block, "always_true")
+    if isinstance(cond, ChironAST.BoolFalse):
+        return _condition_result(block, "always_false")
+
+    supported = (ChironAST.LT, ChironAST.GT, ChironAST.LTE,
+                 ChironAST.GTE, ChironAST.EQ, ChironAST.NEQ)
+    if not isinstance(cond, supported):
+        return _condition_result(block, "unknown")
+
+    try:
+        left = evaluator._eval(cond.lexpr, in_state)
+        right = evaluator._eval(cond.rexpr, in_state)
+    except Exception:
+        return _condition_result(block, "unknown", operator=cond.symbol)
+
+    classification = _classify_interval_comparison(cond, left, right)
+    return _condition_result(
+        block,
+        classification,
+        lhs_interval=left,
+        rhs_interval=right,
+        operator=cond.symbol,
+    )
+
+
+def _classify_conditions(info):
+    evaluator = IntervalTransferFunction()
+    results = {}
+    for block in info.ordered_blocks():
+        if not block.instrlist:
+            continue
+        instr = block.instrlist[0][0]
+        if not isinstance(instr, ChironAST.ConditionCommand):
+            continue
+        in_state = info.bb_in.get(block.name, {})
+        results[block.name] = _classify_condition_block(block, in_state, evaluator)
+    return results
+
+
 def _run_worklist_info(cfg, analysis, debug=False):
     """Inline worklist loop — mirrors AI.AbstractInterpreter.worklistAlgorithm
     but skips the Interpreter base class (which the framework's
@@ -427,7 +568,7 @@ def _run_worklist_info(cfg, analysis, debug=False):
         print(f"Interval analysis hit iteration cap ({iter_cap}) before convergence.")
 
     blocks = _ordered_blocks(cfg)
-    return IntervalInfo(
+    info = IntervalInfo(
         cfg=cfg,
         bb_in=bbIn,
         bb_out=bbOut,
@@ -439,6 +580,8 @@ def _run_worklist_info(cfg, analysis, debug=False):
         iter_cap=iter_cap,
         widening_after=WIDEN_AFTER,
     )
+    info.condition_results = _classify_conditions(info)
+    return info
 
 
 def _run_worklist(cfg, analysis):
