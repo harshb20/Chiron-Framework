@@ -175,6 +175,11 @@ if __name__ == "__main__":
         help="Run GVN/CSE candidate detection.",
     )
     cmdparser.add_argument(
+        "--opt-interval",
+        action="store_true",
+        help="Run interval-based condition rewriting optimization.",
+    )
+    cmdparser.add_argument(
         "--opt-all",
         action="store_true",
         help="Run all optimizations.",
@@ -291,6 +296,7 @@ if __name__ == "__main__":
         or args.opt_cfgsimp
         or args.opt_indvar
         or args.opt_gvn
+        or args.opt_interval
         or args.opt_all
     ):
         irOpt = DFASub.optimize(irHandler, args)

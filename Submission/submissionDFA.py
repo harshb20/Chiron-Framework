@@ -18,6 +18,7 @@ from licm import run_licm
 from cfgsimp import run_cfg_simplify
 from indvar import run_indvar
 from gvn import run_gvn
+from intervalopt import run_interval_rewrite
 
 
 '''
@@ -381,6 +382,7 @@ def optimize(irHandler, args):
     do_simp = args.opt_algsimp or args.opt_all
     do_sccp = args.opt_constprop or args.opt_all
     do_licm = getattr(args, "opt_licm", False) or args.opt_all
+    do_interval = getattr(args, "opt_interval", False) or args.opt_all
     do_cfgsimp = getattr(args, "opt_cfgsimp", False) or args.opt_all
     do_indvar = getattr(args, "opt_indvar", False) or args.opt_all
     do_gvn = getattr(args, "opt_gvn", False) or args.opt_all
@@ -391,6 +393,7 @@ def optimize(irHandler, args):
         or do_simp
         or do_sccp
         or do_licm
+        or do_interval
         or do_cfgsimp
         or do_indvar
         or do_gvn
@@ -414,6 +417,10 @@ def optimize(irHandler, args):
     if do_licm:
         cfg, ssa_info = rebuild_cfg_and_ssa(ir, "opt_cfg_licm")
         ir = run_licm(ir, cfg, ssa_info)
+
+    if do_interval:
+        cfg = cfgB.buildCFG(ir, "opt_cfg_interval", isSingle=True)
+        ir = run_interval_rewrite(ir, cfg=cfg, debug=False)
 
     if do_cfgsimp:
         cfg = cfgB.buildCFG(ir, "opt_cfg_cfgsimp", isSingle=True)
