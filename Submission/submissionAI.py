@@ -1,15 +1,17 @@
 import copy
+from dataclasses import dataclass, field
 import math
+from pathlib import Path
 import sys
-from typing import overload
+from typing import Any, Dict, List, Optional
 
-sys.path.insert(0, "../ChironCore/")
+CHIRON_CORE_DIR = Path(__file__).resolve().parents[1] / "ChironCore"
+if str(CHIRON_CORE_DIR) not in sys.path:
+    sys.path.insert(0, str(CHIRON_CORE_DIR))
 
-import cfg.ChironCFG as cfgK
 import cfg.cfgBuilder as cfgB
 from lattice import  *
 import ChironAST.ChironAST as ChironAST
-import abstractInterpretation as AI
 
 
 INF = math.inf
@@ -134,6 +136,68 @@ class IntervalDomain(Lattice):
 
 TOP = IntervalDomain((-INF, INF))
 BOT = IntervalDomain((1, 0))
+
+
+def _fmt_state(state):
+    if not state:
+        return "{}"
+    items = sorted(state.items())
+    return "{" + ", ".join(f"{k}={v}" for k, v in items) + "}"
+
+
+def _block_sort_key(b):
+    if b.name == "START":
+        return -1
+    if b.name == "END":
+        return 10**9
+    if b.instrlist:
+        return b.instrlist[0][1]
+    return 0
+
+
+def _ordered_blocks(cfg):
+    return sorted(list(cfg.nodes()), key=_block_sort_key)
+
+
+@dataclass
+class IntervalInfo:
+    """Structured interval-analysis result for later optimizer phases."""
+
+    cfg: Any
+    bb_in: Dict[str, Dict[str, IntervalDomain]]
+    bb_out: Dict[str, List[Dict[str, IntervalDomain]]]
+    block_order: List[str]
+    block_map: Dict[str, Any]
+    iterations: int = 0
+    converged: bool = True
+    visit_count: Dict[str, int] = field(default_factory=dict)
+    iter_cap: Optional[int] = None
+    widening_after: Optional[int] = None
+
+    def ordered_blocks(self):
+        return [self.block_map[name] for name in self.block_order if name in self.block_map]
+
+    def format_state(self, state):
+        return _fmt_state(state)
+
+    def format_lines(self):
+        lines = ["===== INTERVAL ANALYSIS ====="]
+        for b in self.ordered_blocks():
+            instr_str = ""
+            if b.instrlist:
+                instr_str = str(b.instrlist[0][0])
+            lines.append(f"  [{b.name}] {instr_str}")
+            lines.append(f"    IN : {self.format_state(self.bb_in.get(b.name, {}))}")
+            out = self.bb_out.get(b.name, [])
+            if len(out) == 2:
+                lines.append(f"    OUT[true] : {self.format_state(out[0])}")
+                lines.append(f"    OUT[false]: {self.format_state(out[1])}")
+            elif len(out) == 1:
+                lines.append(f"    OUT: {self.format_state(out[0])}")
+            else:
+                lines.append("    OUT: (none)")
+        lines.append("=============================")
+        return lines
 
 
 class IntervalTransferFunction(TransferFunction):
@@ -277,7 +341,7 @@ class ForwardAnalysis():
         return result
 
 
-def _run_worklist(cfg, analysis):
+def _run_worklist_info(cfg, analysis, debug=False):
     """Inline worklist loop — mirrors AI.AbstractInterpreter.worklistAlgorithm
     but skips the Interpreter base class (which the framework's
     AbstractInterpreter forgets to pass params to)."""
@@ -358,7 +422,57 @@ def _run_worklist(cfg, analysis):
             for succ in cfg.successors(currBB):
                 wl.put(succ)
 
-    return bbIn, bbOut
+    converged = wl.empty()
+    if debug and not converged:
+        print(f"Interval analysis hit iteration cap ({iter_cap}) before convergence.")
+
+    blocks = _ordered_blocks(cfg)
+    return IntervalInfo(
+        cfg=cfg,
+        bb_in=bbIn,
+        bb_out=bbOut,
+        block_order=[b.name for b in blocks],
+        block_map={b.name: b for b in blocks},
+        iterations=iters,
+        converged=converged,
+        visit_count=visit_count,
+        iter_cap=iter_cap,
+        widening_after=WIDEN_AFTER,
+    )
+
+
+def _run_worklist(cfg, analysis):
+    """Backward-compatible private wrapper for callers expecting IN/OUT maps."""
+    info = _run_worklist_info(cfg, analysis)
+    return info.bb_in, info.bb_out
+
+
+def run_interval(ir, cfg=None, debug=False):
+    """Run interval analysis without mutating or rewriting the IR.
+
+    Args:
+        ir: A Chiron IR list, or an IRHandler-like object with ``ir``/``cfg``.
+        cfg: Optional CFG to reuse. If omitted, a single-instruction CFG is built.
+        debug: If true, prints minimal solver convergence diagnostics.
+
+    Returns:
+        IntervalInfo with structured IN/OUT states and solver metadata.
+    """
+    if cfg is None and hasattr(ir, "cfg"):
+        cfg = ir.cfg
+    if hasattr(ir, "ir"):
+        ir = ir.ir
+    if cfg is None:
+        cfg = cfgB.buildCFG(ir, "ai_cfg", isSingle=True)
+    analysis = ForwardAnalysis()
+    return _run_worklist_info(cfg, analysis, debug=debug)
+
+
+def print_interval_info(info):
+    print()
+    for line in info.format_lines():
+        print(line)
+    print()
 
 
 def analyzeUsingAI(irHandler):
@@ -367,41 +481,6 @@ def analyzeUsingAI(irHandler):
     if cfg is None:
         cfg = cfgB.buildCFG(irHandler.ir, "ai_cfg", isSingle=True)
         irHandler.setCFG(cfg)
-    analysis = ForwardAnalysis()
-    bbIn, bbOut = _run_worklist(cfg, analysis)
-
-    print("\n===== INTERVAL ANALYSIS =====")
-    cfg = irHandler.cfg
-
-    def fmt_state(state):
-        if not state:
-            return "{}"
-        items = sorted(state.items())
-        return "{" + ", ".join(f"{k}={v}" for k, v in items) + "}"
-
-    def block_sort_key(b):
-        if b.name == "START":
-            return -1
-        if b.name == "END":
-            return 10**9
-        if b.instrlist:
-            return b.instrlist[0][1]
-        return 0
-
-    blocks = sorted(cfg.nodes(), key=block_sort_key)
-
-    for b in blocks:
-        instr_str = ""
-        if b.instrlist:
-            instr_str = str(b.instrlist[0][0])
-        print(f"  [{b.name}] {instr_str}")
-        print(f"    IN : {fmt_state(bbIn.get(b.name, {}))}")
-        out = bbOut.get(b.name, [])
-        if len(out) == 2:
-            print(f"    OUT[true] : {fmt_state(out[0])}")
-            print(f"    OUT[false]: {fmt_state(out[1])}")
-        elif len(out) == 1:
-            print(f"    OUT: {fmt_state(out[0])}")
-        else:
-            print(f"    OUT: (none)")
-    print("=============================\n")
+    info = run_interval(irHandler.ir, cfg=cfg)
+    print_interval_info(info)
+    return info
