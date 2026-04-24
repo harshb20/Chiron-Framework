@@ -375,6 +375,26 @@ def _ir_signature(ir):
     return [(type(stmt).__name__, str(stmt), tgt) for stmt, tgt in ir]
 
 
+def _run_interval_cfgsimp_cleanup(ir, max_rounds=2):
+    for round_idx in range(max_rounds):
+        old_ir_signature = _ir_signature(ir)
+
+        cfg = cfgB.buildCFG(
+            ir, f"opt_cfg_interval_cleanup_{round_idx}", isSingle=True
+        )
+        ir = run_interval_rewrite(ir, cfg=cfg, debug=False)
+
+        cfg = cfgB.buildCFG(
+            ir, f"opt_cfg_cfgsimp_cleanup_{round_idx}", isSingle=True
+        )
+        ir = run_cfg_simplify(ir, cfg)
+
+        if _ir_signature(ir) == old_ir_signature:
+            break
+
+    return ir
+
+
 def optimize(irHandler, args):
     ir = copy.deepcopy(irHandler.ir)
 
@@ -418,11 +438,12 @@ def optimize(irHandler, args):
         cfg, ssa_info = rebuild_cfg_and_ssa(ir, "opt_cfg_licm")
         ir = run_licm(ir, cfg, ssa_info)
 
-    if do_interval:
+    if do_interval and do_cfgsimp:
+        ir = _run_interval_cfgsimp_cleanup(ir)
+    elif do_interval:
         cfg = cfgB.buildCFG(ir, "opt_cfg_interval", isSingle=True)
         ir = run_interval_rewrite(ir, cfg=cfg, debug=False)
-
-    if do_cfgsimp:
+    elif do_cfgsimp:
         cfg = cfgB.buildCFG(ir, "opt_cfg_cfgsimp", isSingle=True)
         ir = run_cfg_simplify(ir, cfg)
 
