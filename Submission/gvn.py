@@ -227,8 +227,9 @@ def _invalidate_active_defs(active, defined_var):
             del active[active_key]
 
 
-def collect_gvn_info(ir, cfg, ssa_info):
-    regions = _straight_line_regions(cfg, ssa_info)
+def collect_gvn_info(ir, cfg, ssa_info, regions=None):
+    if regions is None:
+        regions = _straight_line_regions(cfg, ssa_info)
     skipped = []
     groups = {}
     active = {}
@@ -426,6 +427,26 @@ def _target_var(instr):
     return None
 
 
+def _copy_assignment(ir, ir_index):
+    if ir_index is None or ir_index < 0 or ir_index >= len(ir):
+        return None
+
+    instr = ir[ir_index][0]
+    if not isinstance(instr, ChironAST.AssignmentCommand):
+        return None
+    if not isinstance(instr.lvar, ChironAST.Var):
+        return None
+    if not isinstance(instr.rexpr, ChironAST.Var):
+        return None
+
+    dst = instr.lvar.varname
+    src = instr.rexpr.varname
+    if dst == src:
+        return None
+
+    return dst, src
+
+
 def _var_redefined_between(ir, varname, first_index, later_index):
     if first_index is None or later_index is None or later_index <= first_index:
         return True
@@ -437,7 +458,67 @@ def _var_redefined_between(ir, varname, first_index, later_index):
     return False
 
 
-def _rewrite_candidate(ir, new_ir, candidate):
+def _replace_var_in_expr(expr, old_var, new_var):
+    if isinstance(expr, ChironAST.Var):
+        if expr.varname == old_var:
+            return ChironAST.Var(new_var), True
+        return expr, False
+
+    if isinstance(expr, ChironAST.Num):
+        return expr, False
+
+    if isinstance(expr, ChironAST.BinArithOp) or isinstance(expr, ChironAST.BinCondOp):
+        new_left, left_changed = _replace_var_in_expr(expr.lexpr, old_var, new_var)
+        new_right, right_changed = _replace_var_in_expr(expr.rexpr, old_var, new_var)
+        if not left_changed and not right_changed:
+            return expr, False
+        return expr.__class__(new_left, new_right), True
+
+    if isinstance(expr, ChironAST.UnaryArithOp):
+        new_inner, inner_changed = _replace_var_in_expr(expr.expr, old_var, new_var)
+        if not inner_changed:
+            return expr, False
+        return expr.__class__(new_inner), True
+
+    if isinstance(expr, ChironAST.NOT):
+        new_inner, inner_changed = _replace_var_in_expr(expr.expr, old_var, new_var)
+        if not inner_changed:
+            return expr, False
+        return ChironAST.NOT(new_inner), True
+
+    return expr, False
+
+
+def _replace_var_in_instr(instr, old_var, new_var):
+    if isinstance(instr, ChironAST.AssignmentCommand):
+        new_rexpr, changed = _replace_var_in_expr(instr.rexpr, old_var, new_var)
+        if not changed:
+            return instr, False
+        return ChironAST.AssignmentCommand(instr.lvar, new_rexpr), True
+
+    if isinstance(instr, ChironAST.ConditionCommand):
+        new_cond, changed = _replace_var_in_expr(instr.cond, old_var, new_var)
+        if not changed:
+            return instr, False
+        return ChironAST.ConditionCommand(new_cond), True
+
+    if isinstance(instr, ChironAST.MoveCommand):
+        new_expr, changed = _replace_var_in_expr(instr.expr, old_var, new_var)
+        if not changed:
+            return instr, False
+        return ChironAST.MoveCommand(instr.direction, new_expr), True
+
+    if isinstance(instr, ChironAST.GotoCommand):
+        new_x, x_changed = _replace_var_in_expr(instr.xcor, old_var, new_var)
+        new_y, y_changed = _replace_var_in_expr(instr.ycor, old_var, new_var)
+        if not x_changed and not y_changed:
+            return instr, False
+        return ChironAST.GotoCommand(new_x, new_y), True
+
+    return instr, False
+
+
+def _rewrite_candidate(ir, new_ir, candidate, rewritten_copies):
     if candidate.op not in {"+", "-", "*"}:
         return False
 
@@ -472,33 +553,103 @@ def _rewrite_candidate(ir, new_ir, candidate):
             ),
             ir[occurrence.ir_index][1],
         )
+        rewritten_copies[candidate.region_id].add(occurrence.ir_index)
         changed = True
 
     return changed
 
 
-def _apply_local_cse(ir, info):
+def _cleanup_rewritten_copies(ir, regions, ssa_info, rewritten_copies):
+    if not rewritten_copies:
+        return False
+
+    block_by_ir_index = {}
+    for region in regions:
+        for block in region:
+            ir_index = get_block_ir_idx(block)
+            if ir_index is not None:
+                block_by_ir_index[ir_index] = block
+
+    changed = False
+    for region_id, region in enumerate(regions):
+        copy_indices = sorted(rewritten_copies.get(region_id, ()))
+        if not copy_indices:
+            continue
+
+        region_ir_indices = tuple(
+            ir_index
+            for block in region
+            for ir_index in (get_block_ir_idx(block),)
+            if ir_index is not None
+        )
+        positions = {
+            ir_index: pos for pos, ir_index in enumerate(region_ir_indices)
+        }
+
+        for copy_index in copy_indices:
+            copy_pair = _copy_assignment(ir, copy_index)
+            copy_block = block_by_ir_index.get(copy_index)
+            start_pos = positions.get(copy_index)
+            if copy_pair is None or copy_block is None or start_pos is None:
+                continue
+
+            dst, src = copy_pair
+            replaced_blocks = set()
+
+            for later_index in region_ir_indices[start_pos + 1 :]:
+                later_instr = ir[later_index][0]
+                if _target_var(later_instr) in {src, dst}:
+                    break
+
+                new_instr, replaced = _replace_var_in_instr(later_instr, dst, src)
+                if not replaced:
+                    continue
+
+                ir[later_index] = (new_instr, ir[later_index][1])
+                replaced_blocks.add(block_by_ir_index[later_index])
+                changed = True
+
+            dst_version = ssa_info.instr_version_def.get((dst, copy_block))
+            if dst_version is None:
+                continue
+
+            use_blocks = ssa_info.uses.get((dst, dst_version), set())
+            if use_blocks and not use_blocks.issubset(replaced_blocks):
+                continue
+
+            ir[copy_index] = (ChironAST.NoOpCommand(), 1)
+            changed = True
+
+    return changed
+
+
+def _apply_local_cse(ir, info, regions, ssa_info):
     if not info.candidates:
         return ir
 
     new_ir = list(ir)
     changed = False
+    rewritten_copies = defaultdict(set)
 
     for candidate in info.candidates:
-        if _rewrite_candidate(ir, new_ir, candidate):
+        if _rewrite_candidate(ir, new_ir, candidate, rewritten_copies):
             changed = True
+
+    if changed:
+        _cleanup_rewritten_copies(new_ir, regions, ssa_info, rewritten_copies)
 
     return new_ir if changed else ir
 
 
 def run_gvn(ir, cfg, ssa_info, debug=False):
-    info = collect_gvn_info(ir, cfg, ssa_info)
+    regions = _straight_line_regions(cfg, ssa_info)
+    info = collect_gvn_info(ir, cfg, ssa_info, regions=regions)
     run_gvn.last_info = info
 
     if debug:
         dump_gvn_info(info)
 
-    return _apply_local_cse(ir, info)
+    return _apply_local_cse(ir, info, regions, ssa_info)
 
 
 run_gvn.last_info = GVNInfo()
